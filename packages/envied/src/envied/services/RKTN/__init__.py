@@ -44,7 +44,7 @@ class RKTN(Service):
 
     \b
     Command for Titles with no SDR (if not set range to HDR10 it will fail):
-    uv run unshackle dl -r HDR10 [OPTIONS] RKTN -m https://www.rakuten.tv/...
+    uv run envied.dl -r HDR10 [OPTIONS] RKTN -m https://www.rakuten.tv/...
 
     \b
     TODO: - TV Shows are not yet supported as there's 0 TV Shows to purchase, rent, or watch in my region
@@ -587,7 +587,7 @@ class RKTN(Service):
                         audio.channels = audio_info.channel_s or "2.0"
                     
                     # Actualizar codec
-                    # Para Unshackle, necesitas mantener el formato correcto
+                    # Para envied. necesitas mantener el formato correcto
                     audio.codec = Audio.Codec.from_codecs(codec_name)
                     
                     # Agregar el track

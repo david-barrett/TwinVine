@@ -64,7 +64,7 @@ First be sure to follow Devine or envied's install and set-up procedure and ensu
 
 **If you have installed Devine by any other way than via poetry or by  'pip install devine' then remove it and re-install using the correct method before running VineFeeder!  The re-install should pick-up the last configuration. if not re-configure Devine. Make absolutely sure devine can be called from any folder on your system.**  
 
-**If you are using envied make sure you have installed the tool version that runs from the command envied. See https://github.com/envied-dl/envied for installation details**
+**If you are using envied make sure you have installed the tool version that runs from the command envied.See https://github.com/envied-dl/envied for installation details**
 
 **Setup**
 

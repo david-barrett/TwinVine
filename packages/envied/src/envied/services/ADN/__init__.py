@@ -33,28 +33,28 @@ from envied.core.tracks.subtitle import Subtitle
 
 class VideoNoAudio(Video):
     """
-    Video track qui enlève automatiquement l'audio après téléchargement.
-    Nécessaire car ADN fournit des streams HLS avec audio muxé.
+    Video track that automatically removes audio after recording.
+    Necessary because ADN provides HLS streams with muxed audio.
     """
     
     def download(self, session, prepare_drm, max_workers=None, progress=None, *, cdm=None):
-        """Override : télécharge puis demuxe pour enlever l'audio."""
+        """Override: download then demux to remove audio."""
         import logging
         log = logging.getLogger('ADN.VideoNoAudio')
         
-        # Téléchargement normal
+        # Normal download
         super().download(session, prepare_drm, max_workers, progress, cdm=cdm)
         
-        # Si pas de path, échec du téléchargement
+        # If no path, download failed
         if not self.path or not self.path.exists():
             return
         
-        # Vérifier FFmpeg disponible
+        # Check FFmpeg available
         if not binaries.FFMPEG:
             log.warning("FFmpeg not found, cannot remove audio from video")
             return
         
-        # Demuxer : enlever l'audio
+        # Demux: remove audio
         if progress:
             progress(downloaded="Removing audio")
         
@@ -68,8 +68,8 @@ class VideoNoAudio(Video):
                 [
                     binaries.FFMPEG,
                     '-i', str(original_path),
-                    '-vcodec', 'copy',  # Copie vidéo sans réencodage
-                    '-an',              # Enlève l'audio
+                    '-vcodec', 'copy',  # Copy video without re-encoding
+                    '-an',              # Remove audio
                     '-y',
                     str(noaudio_path)
                 ],
@@ -88,7 +88,7 @@ class VideoNoAudio(Video):
                 noaudio_path.unlink(missing_ok=True)
                 return
             
-            # Remplacer le fichier original
+            # Replace original file
             log.debug(f"Video demuxed successfully: {noaudio_path.stat().st_size} bytes")
             original_path.unlink()
             noaudio_path.rename(original_path)
@@ -106,30 +106,30 @@ class VideoNoAudio(Video):
 
 class AudioExtracted(Audio):
     """
-    Audio track déjà extrait d'un flux HLS muxé.
-    Override download() pour copier le fichier au lieu de télécharger.
+    Audio track already extracted from muxed HLS stream.
+    Override download() to copy the file instead of downloading.
     """
     
     def __init__(self, *args, extracted_path: Path, **kwargs):
-        # URL vide pour éviter que curl essaie de télécharger
+        # Empty URL to prevent curl from trying to download
         super().__init__(*args, url="", **kwargs)
         self.extracted_path = extracted_path
     
     def download(self, session, prepare_drm, max_workers=None, progress=None, *, cdm=None):
-        """Override : copie le fichier extrait au lieu de télécharger."""
+        """Override: copies the extracted file instead of downloading."""
         if not self.extracted_path or not self.extracted_path.exists():
             if progress:
                 progress(downloaded="[red]FAILED")
             raise ValueError(f"Extracted audio file not found: {self.extracted_path}")
         
-        # Créer le path de destination (même logique que Track.download)
+        # Create destination path (same logic as Track.download)
         track_type = self.__class__.__name__
         save_path = config.directories.temp / f"{track_type}_{self.id}.m4a"
         
         if progress:
             progress(downloaded="Copying", total=100, completed=0)
         
-        # Copier le fichier extrait vers le path final
+        # Copy the extracted file to the final destination
         config.directories.temp.mkdir(parents=True, exist_ok=True)
         shutil.copy2(self.extracted_path, save_path)
         
@@ -141,30 +141,30 @@ class AudioExtracted(Audio):
 
 class SubtitleEmbedded(Subtitle):
     """
-    Subtitle avec contenu embarqué (data URI).
-    Override download() pour écrire le contenu directement.
+    Subtitle with embedded content (data URI).
+    Override download() to write the content directly.
     """
     
     def __init__(self, *args, embedded_content: str, **kwargs):
-        # URL vide pour éviter que curl essaie de télécharger
+        # Empty URL to prevent curl from trying to download
         super().__init__(*args, url="", **kwargs)
         self.embedded_content = embedded_content
     
     def download(self, session, prepare_drm, max_workers=None, progress=None, *, cdm=None):
-        """Override : écrit le contenu embarqué au lieu de télécharger."""
+        """Override: writes the embedded content instead of downloading."""
         if not self.embedded_content:
             if progress:
                 progress(downloaded="[red]FAILED")
             raise ValueError("No embedded content in subtitle")
         
-        # Créer le path de destination
+        # Create destination path
         track_type = "Subtitle"
         save_path = config.directories.temp / f"{track_type}_{self.id}.{self.codec.extension}"
         
         if progress:
             progress(downloaded="Writing", total=100, completed=0)
         
-        # Ã‰crire le contenu
+        # Write content
         config.directories.temp.mkdir(parents=True, exist_ok=True)
         save_path.write_text(self.embedded_content, encoding='utf-8')
         
@@ -216,29 +216,29 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
     @staticmethod
     @click.command(
         name="ADN", 
-        short_help="Téléchargement depuis Animation Digital Network",
+        short_help="https://animationdigitalnetwork.com",
         help=(
-            "Télécharge des séries ou films depuis ADN.\n\n"
-            "TITLE : L'URL de la série ou son ID (ex: 1125).\n\n"
-            "SYSTÈME DE SÉLECTION :\n"
-            "  - Simple :  '-e 1-5' (épisodes 1 à 5)\n"
-            "  - Saisons : '-e S2' ou '-e S02'  (toute la saison 2) ou '-e S2E1-12'\n"
-            "  - Mixte :   '-e 1,3,S2E5' ou '-e 1,3,S02E05'\n"
-            "  - Bonus :   '-e NC1,OAV1'"
+            "Downloads series or movies from ADN.\n\n"
+            "TITLE: Series URL or ID (eg. 1125).\n\n"
+            "SELECTION SYSTEM:\n"
+            "  - Simple: '-e 1-5' (episodes 1 to 5)\n"
+            "  - Seasons: '-e S2' or '-e S02' (all season 2) or '-e S2E1-12'\n"
+            "  - Mixed: '-e 1,3,S2E5' or '-e 1,3,S02E05'\n"
+            "  - Bonus: '-e NC1,OAV1'"
         )
     )
     @click.argument("title", type=str, required=True)
     @click.option(
         "-e", "--episode", "select", type=str,
-        help="Sélection : numéros, plages (5-10), saisons (S1, S2) ou combiné (S1E5)."
+        help="Selection: numbers, ranges (5-10), seasons (S1, S2) or combined (S1E5)."
     )
     @click.option(
         "--but", is_flag=True,
-        help="Inverse la sélection : télécharge tout SAUF les épisodes spécifiés avec -e."
+        help="Invert selection: download everything EXCEPT episodes specified with -e."
     )
     @click.option(
         "--all", "all_eps", is_flag=True,
-        help="Ignore toutes les restrictions et télécharge l'intégralité de la série."
+        help="Ignore all restrictions and download the entire series."
     )
     @click.pass_context
     def cli(ctx, **kwargs) -> "ADN":
@@ -277,7 +277,7 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
         }
 
     def ensure_authenticated(self) -> None:
-        """Vérifie le token et rafraÃ®chit si nécessaire."""
+        """Checks the token and refreshes if necessary."""
         current_time = int(time.time())
 
         if self.access_token and self.token_expiration and current_time < (self.token_expiration - 60):
@@ -340,13 +340,13 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
         self.token_expiration = int(time.time()) + expires_in
         self.session.headers.update(self.auth_header)
 
-    def _parse_select(self, ep_id: str, short_number: str, season_num: int) -> bool:
-            """Retourne True si l'épisode doit être inclus."""
+    def _parse_select(self, ep_id: str, short_number: str, season_num: int, relative_number: Optional[int] = None) -> bool:
+            """Returns True if the episode should be included."""
             if self.all_eps or not self.select_str:
                 return True
 
-            # Préparation des identifiants possibles pour cet épisode
-            # On teste : "30353" (id), "1" (numéro), "S02E01" (format complet), "S02" (saison entière)
+            # Preparing possible identifiers for this episode
+            # We test: "30353" (id), "1" (number), "S02E01" (full format), "S02" (entire season)
             candidates = [
                 str(ep_id),
                 str(short_number).lstrip("0"),
@@ -354,25 +354,29 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
                 f"S{season_num:02d}"
             ]
             
+            # Add the relative match (e.g. S03E06 for episode 30 which is the 6th ep in S3)
+            if relative_number is not None:
+                candidates.append(f"S{season_num:02d}E{relative_number:02d}")
+            
             parts = re.split(r'[ ,]+', self.select_str.strip().upper())
             selection: set[str] = set()
 
             for part in parts:
                 if '-' in part:
                     start_p, end_p = part.split('-', 1)
-                    # Gestion des plages S02E01-S02E04
+                    # Handle ranges S02E01-S02E04
                     m_start = re.match(r'^S(\d+)E(\d+)$', start_p)
                     m_end = re.match(r'^S(\d+)E(\d+)$', end_p)
                     
                     if m_start and m_end:
                         s_start, e_start = map(int, m_start.groups())
                         s_end, e_end = map(int, m_end.groups())
-                        if s_start == s_end: # Même saison
+                        if s_start == s_end: # Same season
                             for i in range(e_start, e_end + 1):
                                 selection.add(f"S{s_start:02d}E{i:02d}")
                         continue
                     
-                    # Plages classiques (1-10)
+                    # Classic ranges (1-10)
                     nums = re.findall(r'\d+', part)
                     if len(nums) >= 2:
                         for i in range(int(nums[0]), int(nums[1]) + 1):
@@ -384,18 +388,18 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
             return not included if self.but else included
 
     def get_titles(self) -> Series:
-            """Récupère les épisodes avec le titre réel de la série."""
+            """Retrieves episodes with the actual title of the series."""
             show_id = self.parse_show_id(self.title)
             
-            # 1. Récupérer d'abord les infos globales du show pour avoir le titre propre
+            # 1. Fetch the overall show info first to get the proper title
             show_url = self.config["endpoints"]["show"].format(show_id=show_id)
             show_res = self.session.get(show_url).json()
             
-            # On extrait le titre de la série (ex: "Demon Slave")
-            # C'est ce titre qui servira de nom au dossier unique
+            # We extract the series title (e.g. "Demon Slave")
+            # This title will be used as the unique folder name
             series_title = show_res["videos"][0]["show"]["title"] if show_res.get("videos") else "ADN Show"
 
-            # 2. Récupérer ensuite la structure par saisons
+            # 2. Fetch the season structure afterwards
             url_seasons = self.config["endpoints"].get("seasons")
             if not url_seasons:
                 url_seasons = "https://gw.api.animationdigitalnetwork.com/video/show/{show_id}/seasons?maxAgeCategory=18&order=asc"
@@ -403,7 +407,7 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
             res = self.session.get(url_seasons.format(show_id=show_id)).json()
 
             if not res.get("seasons"):
-                self.log.error(f"Aucune saison trouvée pour l'ID {show_id}")
+                self.log.error(f"No seasons found for ID {show_id}")
                 return Series([])
 
             episodes = []
@@ -411,40 +415,178 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
                 s_val = str(season_data.get("season", "1"))
                 season_num = int(s_val) if s_val.isdigit() else 1
                 
-                for vid in season_data.get("videos", []):
+                for idx, vid in enumerate(season_data.get("videos", []), 1):
                     video_id = str(vid["id"])
                     
-                    # Nettoyage du numéro d'épisode (on ne garde que les chiffres)
+                    # Clean the episode number (keep only digits)
                     num_match = re.search(r'\d+', str(vid.get("number", "0")))
                     short_number = num_match.group() if num_match else "0"
 
-                    # Logique de sélection (SxxEyy)
-                    if not self._parse_select(video_id, short_number, season_num):
+                    # Selection logic (SxxEyy) - Relative and absolute support
+                    if not self._parse_select(video_id, short_number, season_num, relative_number=idx):
                         continue
 
-                    # Création de l'épisode
+                    # Create the episode
                     episodes.append(Episode(
                         id_=video_id,
                         service=self.__class__,
-                        title=series_title,     # Dossier : "Demon Slave"
-                        season=season_num,      # Saison : 2
-                        number=int(short_number),
-                        name=vid.get("name") or "", # Nom : "La grande réunion..."
+                        title=series_title,     # Folder: "Demon Slave"
+                        season=season_num,      # Season: 2
+                        number=idx,             # Force relative number (e.g. 30 becomes 6 in S3)
+                        name=vid.get("name") or "", # Name: "The big reunion..."
                         data=vid
                     ))
 
             episodes.sort(key=lambda x: (x.season, x.number))
             return Series(episodes)
 
+    def get_discovery(self, n: int = 12) -> list[dict]:
+        """
+        Fetch the latest releases (Series) via the catalog API.
+        """
+        self.ensure_authenticated()
+        
+        try:
+            url = self.config["endpoints"]["search"]
+            response = self.session.get(
+                url,
+                params={
+                    "maxAgeCategory": 18,
+                    "order": "new",
+                    "limit": n
+                }
+            )
+            
+            if response.status_code != 200:
+                self.log.error(f"Catalog fetch failed: {response.status_code}")
+                return []
+                
+            data = response.json()
+            return data.get("shows", [])
+            
+        except Exception as e:
+            self.log.error(f"Error fetching discovery: {e}")
+            return []
+
+    def get_latest_releases_calendar(self, n: int = 12) -> list[dict]:
+        """
+        Fetch the latest releases (Episodes) via the calendar API.
+        Returns recent episodes with their actual release dates.
+        """
+        from datetime import datetime, timedelta
+        import requests
+        
+        # self.ensure_authenticated()
+        
+        try:
+            results = []
+            seen_episodes = set()
+            
+            # Use a fresh session to avoid auth issues if calendar is public
+            cal_session = requests.Session()
+            cal_session.headers.update({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            })
+            
+            # Fetch calendar for the last 7 days including today
+            today = datetime.now()
+            
+            for day_offset in range(15):
+                date = today - timedelta(days=day_offset)
+                date_str = date.strftime("%Y-%m-%d")
+                
+                # Calendar endpoint
+                calendar_url = f"https://gw.api.animationdigitalnetwork.com/video/calendar?maxAgeCategory=18&date={date_str}"
+                
+                try:
+                    res = cal_session.get(calendar_url, timeout=5)
+                    if res.status_code != 200: continue
+                    
+                    data = res.json()
+                    # Handle dict response (API returns {"videos": [...]})
+                    if isinstance(data, dict):
+                        data = data.get("videos", [])
+                        
+                    for video in data:
+                        show = video.get("show", {})
+                        show_id = str(show.get("id", ""))
+                        ep_id = str(video.get("id", ""))
+                        
+                        if (show_id, ep_id) in seen_episodes: continue
+                        seen_episodes.add((show_id, ep_id))
+                        
+                        results.append(video)
+                except:
+                     pass
+            
+            # Sort by releaseDate
+            results.sort(key=lambda x: x.get("releaseDate", ""), reverse=True)
+            return results[:n]
+            
+        except Exception as e:
+            self.log.error(f"Error fetching calendar discovery: {e}")
+            return []
+
+    def get_latest_episode(self, show_id: str) -> Episode | None:
+        """
+        Retrieves the absolute latest episode of a series without filtering.
+        Used by the GUI to display 'Latest' info.
+        """
+        try:
+            # 1. Fetch seasons
+            url_seasons = self.config["endpoints"].get("seasons")
+            if not url_seasons:
+                url_seasons = "https://gw.api.animationdigitalnetwork.com/video/show/{show_id}/seasons?maxAgeCategory=18&order=asc"
+                
+            res = self.session.get(url_seasons.format(show_id=show_id))
+            if res.status_code != 200:
+                return None
+                
+            data = res.json()
+            if not data.get("seasons"):
+                return None
+
+            episodes = []
+            for season_data in data["seasons"]:
+                s_val = str(season_data.get("season", "1"))
+                season_num = int(s_val) if s_val.isdigit() else 1
+                
+                for vid in season_data.get("videos", []):
+                    # Simplified parsing similar to get_titles
+                    num_match = re.search(r'\d+', str(vid.get("number", "0")))
+                    short_number = int(num_match.group()) if num_match else 0
+                    
+                    episodes.append(Episode(
+                        id_=str(vid["id"]),
+                        service=self.__class__,
+                        title="", # We don't need the series title here for simple display
+                        season=season_num,
+                        number=short_number,
+                        name=vid.get("name") or "",
+                        data=vid
+                    ))
+
+            if not episodes:
+                return None
+                
+            # Sort: Season desc, Number desc to find absolute latest?
+            # Or Season asc, Number asc and take [-1]
+            episodes.sort(key=lambda x: (x.season, x.number))
+            return episodes[-1]
+            
+        except Exception as e:
+            self.log.error(f"Error in get_latest_episode: {e}")
+            return None
+
     def get_tracks(self, title: Episode) -> Tracks:
         """
-        Récupère les pistes en pré-extrayant les audios.
-        Les audios sont extraits maintenant et seront copiés pendant download().
+        Fetches tracks by pre-extracting audio.
+        Audio is extracted now and will be copied during download().
         """
         self.ensure_authenticated()
         vid_id = title.id
 
-        # Configuration du lecteur
+        # Player configuration
         config_url = self.config["endpoints"]["player_config"].format(video_id=vid_id)
         config_res = self.session.get(config_url).json()
 
@@ -452,7 +594,7 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
         if not player_opts["user"]["hasAccess"]:
             raise PermissionError("No access to this video (Premium required?)")
 
-        # Token du lecteur
+        # Player token
         refresh_url = player_opts["user"].get("refreshTokenUrl") or self.config["endpoints"]["player_refresh"]
         token_res = self.session.post(
             refresh_url,
@@ -462,7 +604,7 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
         player_token = token_res["token"]
         links_url = player_opts["video"].get("url") or self.config["endpoints"]["player_links"].format(video_id=vid_id)
 
-        # Chiffrement RSA
+        # RSA Encryption
         rand_key = uuid.uuid4().hex[:16]
         payload = json.dumps({"k": rand_key, "t": player_token}).encode('utf-8')
 
@@ -474,7 +616,7 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
         encrypted = public_key.encrypt(payload, padding.PKCS1v15())
         auth_header_val = base64.b64encode(encrypted).decode('utf-8')
 
-        # Récupération des liens
+        # Fetching links
         links_res = self.session.get(
             links_url,
             params={"freeWithAds": "true", "adaptive": "true", "withMetadata": "true", "source": "Web"},
@@ -484,7 +626,7 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
         tracks = Tracks()
         streaming_links = links_res.get("links", {}).get("streaming", {})
 
-        # Map des langues
+        # Language map
         lang_map = {
             "vf": "fr",
             "vostf": "ja",
@@ -492,7 +634,7 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
             "vostde": "ja",
         }
 
-        # Priorité: VOSTF (original) pour la vidéo principale
+        # Priority: VOSTF (original) for the main video
         priority_order = ["vostf", "vf", "vde", "vostde"]
         available_streams = {k: v for k, v in streaming_links.items() if k in lang_map}
         
@@ -504,7 +646,7 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
         if not sorted_streams:
             raise ValueError("No supported streams found")
 
-        # Vidéo principale (VOSTF ou premier disponible)
+        # Main video (VOSTF or first available)
         primary_stream = sorted_streams[0]
         primary_lang = lang_map[primary_stream]
         
@@ -521,7 +663,7 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
             tracks.add(video_track)
             self.log.info(f"Video track added: {video_track.width}x{video_track.height}")
 
-        # Extraire audios pour toutes les langues disponibles
+        # Extract audio for all available languages
         for stream_type in sorted_streams:
             audio_lang = lang_map[stream_type]
             is_original = stream_type in ["vostf", "vostde"]
@@ -540,12 +682,12 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
                 tracks.add(audio_track, warn_only=True)
                 self.log.info(f"Audio track added: {audio_lang}")
 
-        # Stocker les données de chapitres pour get_chapters()
+        # Store chapter data for get_chapters()
         if "video" in links_res:
             title.data["chapter_data"] = links_res["video"]
             self.log.debug(f"Stored chapter data: intro={links_res['video'].get('tcIntroStart')}, ending={links_res['video'].get('tcEndingStart')}")
 
-        # Sous-titres
+        # Subtitles
         self._process_subtitles(links_res, rand_key, title, tracks)
 
         if not tracks.videos:
@@ -554,7 +696,7 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
         return tracks
 
     def _get_video_track(self, stream_data: dict, stream_type: str, lang: str, is_original: bool):
-        """Récupère la piste vidéo principale (sans audio)."""
+        """Fetches the main video track (without audio)."""
         try:
             m3u8_url = self._resolve_stream_url(stream_data, stream_type)
             if not m3u8_url:
@@ -567,13 +709,13 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
                 self.log.warning(f"No video tracks found for {stream_type}")
                 return None
 
-            # Meilleure qualité
+            # Best quality
             best_video = max(
                 hls_tracks.videos,
                 key=lambda v: (v.height or 0, v.width or 0, v.bitrate or 0)
             )
 
-            # Convertir en VideoNoAudio pour demuxer automatiquement
+            # Convert to VideoNoAudio to demux automatically
             video_no_audio = VideoNoAudio(
                 id_=best_video.id,
                 url=best_video.url,
@@ -599,36 +741,67 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
 
     def _extract_audio_track(self, stream_data: dict, stream_type: str, lang: str, is_original: bool, title: Episode):
         """
-        Extrait l'audio et retourne un AudioExtracted.
-        L'audio est extrait MAINTENANT et sera copié pendant download().
+        Extracts audio and returns an AudioExtracted.
+        Audio is extracted NOW and will be copied during download().
         """
         if not binaries.FFMPEG:
             self.log.warning("FFmpeg not found, cannot extract audio")
             return None
 
         try:
-            m3u8_url = self._resolve_stream_url(stream_data, stream_type)
+            m3u8_url = self._resolve_stream_url(stream_data, stream_type, prioritize_auto=True)
             if not m3u8_url:
                 return None
 
-            # Créer un répertoire temp pour ADN dans le temp d'Unshackle
+            # Create an ADN temp directory inside envied.s temp
             adn_temp = config.directories.temp / "adn_audio_extracts"
             adn_temp.mkdir(parents=True, exist_ok=True)
             
-            # Nom de fichier unique basé sur video_id + langue
+            # Unique filename based on video_id + language
             audio_filename = f"audio_{title.id}_{stream_type}.m4a"
             audio_path = adn_temp / audio_filename
 
-            # Si déjÃ  extrait, réutiliser
+            # If already extracted, reuse it
             if audio_path.exists() and audio_path.stat().st_size > 1000:
                 self.log.debug(f"Reusing existing extracted audio: {audio_path}")
             else:
 
-                # Extraire avec FFmpeg
+                # Parse M3U8 to find best audio
+                best_m3u8_url = m3u8_url
+                try:
+                    import m3u8
+                    variant_m3u8 = m3u8.load(m3u8_url)
+                    
+                    audio_playlists = []
+                    # Check for alternative audio in media
+                    for media in variant_m3u8.media:
+                        if media.type == "AUDIO" and media.uri:
+                             audio_playlists.append(media.uri)
+
+                    # If no media, check strict playlists (variants)
+                    if not audio_playlists and variant_m3u8.playlists:
+                        # Sort by bandwidth descending
+                        sorted_playlists = sorted(variant_m3u8.playlists, key=lambda x: x.stream_info.bandwidth or 0, reverse=True)
+                        audio_playlists = [p.uri for p in sorted_playlists]
+
+                    if audio_playlists:
+                        # Construct absolute URL if needed
+                        from urllib.parse import urljoin
+                        best_audio_uri = audio_playlists[0]
+                        if not best_audio_uri.startswith("http"):
+                           best_m3u8_url = urljoin(m3u8_url, best_audio_uri)
+                        else:
+                           best_m3u8_url = best_audio_uri
+                        self.log.info(f"Selected best audio stream: {best_m3u8_url}")
+
+                except Exception as e:
+                    self.log.warning(f"Failed to parse M3U8 for best audio, using default: {e}")
+
+                # Extract with FFmpeg
                 result = subprocess.run(
                     [
                         binaries.FFMPEG,
-                        '-i', m3u8_url,
+                        '-i', best_m3u8_url,
                         '-vn',
                         '-acodec', 'copy',
                         '-y',
@@ -649,14 +822,35 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
                     audio_path.unlink(missing_ok=True)
                     return None
 
-            # Créer AudioExtracted avec le fichier pré-extrait
+            # Detect actual bitrate
+            detected_bitrate = 128000
+            try:
+                from pymediainfo import MediaInfo
+                media_info = MediaInfo.parse(audio_path)
+                if media_info.audio_tracks:
+                    track = media_info.audio_tracks[0]
+                    if track.bit_rate:
+                        detected_bitrate = int(track.bit_rate)
+                    elif track.other_bit_rate:
+                        # Fallback for some formats
+                        try:
+                            # other_bit_rate is typically list like ['128 kb/s']
+                            raw = track.other_bit_rate[0]
+                            detected_bitrate = int(re.sub(r'[^\d]', '', raw)) * 1000
+                        except:
+                            pass
+                self.log.debug(f"Detected audio bitrate: {detected_bitrate}")
+            except Exception as e:
+                self.log.warning(f"Failed to detect bitrate: {e}")
+
+            # Create AudioExtracted with the pre-extracted file
             audio_track = AudioExtracted(
                 id_=f"audio-{stream_type}-{lang}",
                 extracted_path=audio_path,
                 codec=Audio.Codec.AAC,
                 language=Language.get(lang),
                 is_original_lang=is_original,
-                bitrate=128000,
+                bitrate=detected_bitrate,
                 channels=2.0,
             )
             
@@ -669,9 +863,12 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
             self.log.error(f"Failed to extract audio for {stream_type}: {e}")
             return None
 
-    def _resolve_stream_url(self, stream_data: dict, stream_type: str) -> Optional[str]:
-        """Résout l'URL du stream."""
-        preferred_keys = ["fhd", "hd", "auto", "sd", "mobile"]
+    def _resolve_stream_url(self, stream_data: dict, stream_type: str, prioritize_auto: bool = False) -> Optional[str]:
+        """Resolves the stream URL."""
+        if prioritize_auto:
+             preferred_keys = ["auto", "fhd", "hd", "sd", "mobile"]
+        else:
+             preferred_keys = ["fhd", "hd", "auto", "sd", "mobile"]
 
         m3u8_url = None
         for key in preferred_keys:
@@ -706,7 +903,7 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
             return None
 
     def _process_subtitles(self, links_res: dict, rand_key: str, title: Episode, tracks: Tracks):
-        """Traite les sous-titres."""
+        """Processes subtitles."""
         subs_root = links_res.get("links", {}).get("subtitles", {})
         if "all" not in subs_root:
             self.log.debug("No subtitles available")
@@ -732,13 +929,13 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
             decryptor = cipher.decryptor()
             decrypted_padded = decryptor.update(ciphertext) + decryptor.finalize()
 
-            # TOUJOURS retirer le padding PKCS7 (Python ne le fait pas automatiquement)
+            # ALWAYS remove PKCS7 padding (Python doesn't do it automatically)
             pad_len = decrypted_padded[-1]
             if not (1 <= pad_len <= 16):
                 self.log.error(f"Invalid PKCS7 padding length: {pad_len}")
                 return
             
-            # Vérifier que tous les bytes de padding ont la même valeur
+            # Ensure all padding bytes have the same value
             padding = decrypted_padded[-pad_len:]
             if not all(b == pad_len for b in padding):
                 self.log.error(f"Invalid PKCS7 padding bytes")
@@ -759,7 +956,7 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
                 self.log.warning("subs_data is empty!")
                 return
             
-            # Debug chaque clé
+            # Debug each key
             for key in subs_data.keys():
                 value = subs_data[key]
                 if isinstance(value, list) and len(value) > 0:
@@ -781,24 +978,32 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
                 self.log.debug(f"  Cues count: {len(cues)}")
                 self.log.debug(f"  First cue: {cues[0]}")
                 
-                if "vf" in sub_lang_key.lower() or "vostf" in sub_lang_key.lower():
+                if "vf" in sub_lang_key.lower():
                     target_lang = "fr"
-                elif "vde" in sub_lang_key.lower() or "vostde" in sub_lang_key.lower():
+                    is_forced = True
+                elif "vostf" in sub_lang_key.lower():
+                    target_lang = "fr"
+                    is_forced = False
+                elif "vde" in sub_lang_key.lower():
                     target_lang = "de"
+                    is_forced = True
+                elif "vostde" in sub_lang_key.lower():
+                    target_lang = "de"
+                    is_forced = False
                 else:
                     self.log.debug(f"Skipping subtitle language: {sub_lang_key}")
                     continue
 
-                if target_lang in processed_langs:
-                    self.log.debug(f"Already processed {target_lang}, skipping")
+                if (target_lang, is_forced) in processed_langs:
+                    self.log.debug(f"Already processed {target_lang} (forced={is_forced}), skipping")
                     continue
                 
-                processed_langs.add(target_lang)
+                processed_langs.add((target_lang, is_forced))
 
-                # Convertir en ASS
+                # Convert to ASS
                 ass_content = self._json_to_ass(cues, title.title, title.number)
                 
-                # Vérifier si le fichier ASS a du contenu
+                # Check if ASS file has content
                 event_count = ass_content.count("Dialogue:")
                 self.log.debug(f"Generated ASS with {event_count} dialogue events")
                 
@@ -806,13 +1011,13 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
                     self.log.warning(f"ASS file has no dialogue events!")
                     self.log.warning(f"First cue was: {cues[0] if cues else 'EMPTY LIST'}")
                 
-                # Créer SubtitleEmbedded avec le contenu ASS directement
+                # Create SubtitleEmbedded directly with ASS content
                 subtitle = SubtitleEmbedded(
                     id_=f"sub-{target_lang}-{sub_lang_key}",
-                    embedded_content=ass_content,  # Contenu ASS directement
+                    embedded_content=ass_content,  # ASS content directly
                     codec=Subtitle.Codec.SubStationAlphav4,
                     language=Language.get(target_lang),
-                    forced=False,
+                    forced=is_forced,
                     sdh=False,
                 )
                 
@@ -829,19 +1034,19 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
 
     def get_chapters(self, title: Episode) -> Chapters:
         """
-        Crée les chapitres à partir des timecodes ADN.
-        - Si tcIntroStart existe:
-            - Si tcIntroStart != "00:00:00": ajouter "Prologue" à 00:00:00
-            - Ajouter "Opening" à tcIntroStart
-            - Ajouter "Episode" à tcIntroEnd
-        - Sinon: ajouter "Episode" à 00:00:00
-        - Si tcEndingStart existe:
-            - Ajouter "Ending Start" à tcEndingStart
-            - Ajouter "Ending End" à tcEndingEnd
+        Creates chapters from ADN timecodes.
+        - If tcIntroStart exists:
+            - If tcIntroStart != "00:00:00": add "Prologue" at 00:00:00
+            - Add "Opening" at tcIntroStart
+            - Add "Episode" at tcIntroEnd
+        - Otherwise: add "Episode" at 00:00:00
+        - If tcEndingStart exists:
+            - Add "Ending Start" at tcEndingStart
+            - Add "Ending End" at tcEndingEnd
         """
         chapters = Chapters()
         
-        # Récupérer les données de chapitres stockées dans get_tracks()
+        # Retrieve chapter data stored in get_tracks()
         chapter_data = title.data.get("chapter_data", {})
         if not chapter_data:
             self.log.debug("No chapter data available")
@@ -855,51 +1060,73 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
         self.log.debug(f"Chapter timecodes: intro={tc_intro_start}->{tc_intro_end}, ending={tc_ending_start}->{tc_ending_end}")
         
         try:
+            chapter_num = 1
+            
             if tc_intro_start:
-                # Si l'intro ne commence pas à 00:00:00, ajouter un prologue
+                # If intro does not start at 00:00:00, add a prologue (Chapter 1)
                 if tc_intro_start != "00:00:00":
                     chapters.add(Chapter(
                         timestamp=0,
-                        name="Prologue"
+                        name=f"Chapter {chapter_num}"
                     ))
-                    self.log.debug("Added Prologue chapter at 00:00:00")
+                    self.log.debug(f"Added Chapter {chapter_num} at 00:00:00")
+                    chapter_num += 1
                 
                 # Opening
                 chapters.add(Chapter(
                     timestamp=self._timecode_to_ms(tc_intro_start),
                     name="Opening"
                 ))
-                self.log.debug(f"Added Opening chapter at {tc_intro_start}")
+                self.log.debug(f"Added Opening at {tc_intro_start}")
                 
-                # Episode (après l'intro)
+                # Episode (after intro)
                 if tc_intro_end:
                     chapters.add(Chapter(
                         timestamp=self._timecode_to_ms(tc_intro_end),
-                        name="Episode"
+                        name=f"Chapter {chapter_num}"
                     ))
-                    self.log.debug(f"Added Episode chapter at {tc_intro_end}")
+                    self.log.debug(f"Added Chapter {chapter_num} at {tc_intro_end}")
+                    chapter_num += 1
             else:
-                # Pas d'intro, épisode commence à 00:00:00
+                # No intro, episode starts at 00:00:00
                 chapters.add(Chapter(
                     timestamp=0,
-                    name="Episode"
+                    name=f"Chapter {chapter_num}"
                 ))
-                self.log.debug("Added Episode chapter at 00:00:00 (no intro)")
+                self.log.debug(f"Added Chapter {chapter_num} at 00:00:00 (no intro)")
+                chapter_num += 1
             
             # Ending
             if tc_ending_start:
                 chapters.add(Chapter(
                     timestamp=self._timecode_to_ms(tc_ending_start),
-                    name="Ending Start"
+                    name="Ending"
                 ))
-                self.log.debug(f"Added Ending Start chapter at {tc_ending_start}")
+                self.log.debug(f"Added Ending at {tc_ending_start}")
                 
                 if tc_ending_end:
-                    chapters.add(Chapter(
-                        timestamp=self._timecode_to_ms(tc_ending_end),
-                        name="Ending End"
-                    ))
-                    self.log.debug(f"Added Ending End chapter at {tc_ending_end}")
+                    # Check if the remaining chapter has a significant duration (> 10s)
+                    # to avoid micro-chapters of 2s, while keeping actual post-credits scenes.
+                    
+                    tc_end_ms = self._timecode_to_ms(tc_ending_end)
+                    total_duration_s = title.data.get("duration", 0)
+                    total_duration_ms = int(total_duration_s * 1000)
+                    
+                    # If duration is unknown or > 10 seconds remaining
+                    should_add = True
+                    if total_duration_ms > 0:
+                        remaining_ms = total_duration_ms - tc_end_ms
+                        if remaining_ms < 10000: # Less than 10s
+                            should_add = False
+                            self.log.debug(f"Skipping post-ending chapter (only {remaining_ms}ms remaining)")
+                    
+                    if should_add:
+                        chapters.add(Chapter(
+                            timestamp=tc_end_ms,
+                            name=f"Chapter {chapter_num}"
+                        ))
+                        self.log.debug(f"Added Chapter {chapter_num} at {tc_ending_end}")
+                        chapter_num += 1
             
             self.log.info(f"✓ Created {len(chapters)} chapters")
             
@@ -935,17 +1162,20 @@ KhS+IFEqwvZqgbBpKuwIDAQAB
         raise ValueError(f"Invalid ADN Show ID/URL: {input_str}")
 
     def _json_to_ass(self, cues: List[dict], title: str, ep_num: Union[int, str]) -> str:
-        """Convertit les sous-titres JSON en ASS."""
+        """Converts JSON subtitles to ASS."""
         header = """[Script Info]
 ScriptType: v4.00+
 WrapStyle: 0
-PlayResX: 1280
-PlayResY: 720
+Collisions: Normal
+PlayResX: 1920
+PlayResY: 1080
+Timer: 0.0000
+WrapStyle: 0
 ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,50,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,1.95,0,2,0,0,70,0
+Style: Default,Trebuchet MS,66,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,3,3,2,75,75,75,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -955,7 +1185,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         line_align_map = {"middle": 8, "end": 4}
 
         def format_time(seconds: float) -> str:
-            """Format exact d'adn : HH:MM:SS.CC (centisecondes sur 2 chiffres)"""
+            """Exact ADN format: HH:MM:SS.CC (2-digit centiseconds)"""
             secs = int(seconds)
             centiseconds = round((seconds - secs) * 100)
             
@@ -963,7 +1193,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             minutes = (secs % 3600) // 60
             remaining_seconds = secs % 60
             
-            # Padding sur 2 chiffres pour TOUT (hours inclus)
+            # 2-digit padding for EVERYTHING (including hours)
             return f"{hours:02d}:{minutes:02d}:{remaining_seconds:02d}.{centiseconds:02d}"
 
         for cue in cues:
@@ -971,11 +1201,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             end_time = cue.get("endTime", 0)
             text = cue.get("text", "")
             
-            # Skip si texte vide
+            # Skip if text is empty
             if not text or not text.strip():
                 continue
 
-            # Nettoyage EXACT du code adn
+            # EXACT cleanup corresponding to ADN code
             text = text.replace(' \\N', '\\N')  # remove space before \\N at end
             if text.endswith('\\N'):
                 text = text[:-2]  # remove \\N at end
@@ -993,7 +1223,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 text = text[:-2]
             text = text.rstrip()  # remove trailing spaces
             
-            # Skip après nettoyage si vide
+            # Skip after cleanup if empty
             if not text.strip():
                 continue
 

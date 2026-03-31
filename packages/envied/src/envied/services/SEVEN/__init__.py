@@ -42,9 +42,9 @@ class SEVEN(Service):
 
     \b
     Examples:
-        - SERIES: unshackle dl -w s01e01 7plus https://7plus.com.au/ncis-los-angeles
-        - EPISODE: unshackle dl 7plus https://7plus.com.au/ncis-los-angeles?episode-id=NCIL01-001
-        - MOVIE: unshackle dl 7plus --movie https://7plus.com.au/puss-in-boots-the-last-wish
+        - SERIES: envied.dl -w s01e01 7plus https://7plus.com.au/ncis-los-angeles
+        - EPISODE: envied.dl 7plus https://7plus.com.au/ncis-los-angeles?episode-id=NCIL01-001
+        - MOVIE: envied.dl 7plus --movie https://7plus.com.au/puss-in-boots-the-last-wish
 
     """
 

@@ -125,7 +125,7 @@ curl_impersonate:
 
 ## directories (dict)
 
-Override the default directories used across envied.  
+Override the default directories used across envied. 
 The directories are set to common values by default.
 
 The following directories are available and may be overridden,
@@ -246,7 +246,7 @@ decryption: mp4decrypt
 
 ## filenames (dict)
 
-Override the default filenames used across envied.  
+Override the default filenames used across envied. 
 The filenames use various variables that are replaced during runtime.
 
 The following filenames are available and may be overridden:
@@ -305,7 +305,7 @@ accessible outside their hosting platform.
 ### Using an API Vault
 
 API vaults use a specific HTTP request format, therefore API or HTTP Key Vault APIs from other projects or services may
-not work in envied. The API format can be seen in the [API Vault Code](envied/vaults/API.py).
+not work in envied.The API format can be seen in the [API Vault Code](envied/vaults/API.py).
 
 ```yaml
 - type: API

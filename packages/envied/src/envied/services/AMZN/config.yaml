@@ -9,72 +9,29 @@ certificate: |
   uGl1ComHxXV9i1AqHwzzY2JY2vFqo73jR3IElr6oChPIwcNokmNc0D4TXtjE0BoYkbWKJfHvJJihzMOvDicWUsemVHvua9/FBtpbHgpbgwijFPjtQF9Ldb
   8Swf
 
+# device:
+#   new:
+#     domain: Device
+#     app_name: 'com.amazon.amazonvideo.livingroom'  # AIV, com.amazon.amazonvideo.livingroom
+#     app_version: '1.1'  # AIV: 3.12.0, livingroom: 1.1
+#     device_model: 'Nexus Player'  # SHIELD Android TV, Nexus Player
+#     os_version: '8.0.0'  # 25, 8.0.0
+#     device_type: 'A2SNKIF736WF4T'
+#     device_name: '%FIRST_NAME%''s%DUPE_STRATEGY_1ST% Nexus Player'
+#     device_serial: 'a906a7f9bfd6a7ab' # f8eb5625fd608718
+
+
 device:
-  
-  # old:  # !<< take note that this is done per-profile
-  #   domain: Device
-  #   app_name: AIV
-  #   app_version: '3.12.0'
-  #   device_model: 'SHIELD Android TV'
-  #   os_version: '28'
-  #   device_type: A1KAXIG6VXSG8Y
-  #   device_serial: '13f5b56b4a17de5d136f0e4c28236109'  # os.urandom(16).hex()
-  #   device_name: "Build/LMY47D Shield TV"
-  #   software_version: '248'
-
-  # old2:
-  #   'domain': 'DeviceLegacy'
-  #   'device_type': A1KAXIG6VXSG8Y,
-  #   'device_serial': '870f53d1b509594c2f8cd5e340a7d374'
-  #   'app_name': 'com.amazon.avod.thirdpartyclient'
-  #   'app_version': '296016847'
-  #   'device_model': 'mdarcy/nvidia/SHIELD Android TV'
-  #   'os_version': 'NVIDIA/mdarcy/mdarcy:11/RQ1A.210105.003/7094531_2971.7725:user/release-keys'
-  
-  # old3:
-  #   domain: Device
-  #   app_name: com.amazon.amazonvideo.livingroom
-  #   app_version: '1.4'
-  #   device_model: PadFone
-  #   os_version: '6.2.5'
-  #   device_type: 'A2SNKIF736WF4T'
-  #   device_name: 'T008 Build/JSS15Q PadFone' # "%FIRST_NAME%'s%DUPE_STRATEGY_1ST% PadFone"
-  #   device_serial: 'c1ebbb433da4afdf'
-  
-  # old4:
-  #   domain: Device
-  #   app_name: com.amazon.amazonvideo.livingroom
-  #   app_version: '1.4'
-  #   device_model: 'Hisense TV'
-  #   os_version: '3.9.5'
-  #   device_type: 'A3T3XXY42KZQNP' # A2B5DGIWVDH8J3, A3GTP8TAF8V3YG, AFTHA001 # https://developer.amazon.com/docs/fire-tv/identify-amazon-fire-tv-devices.html, https://github.com/giofrida/Hisense-Amazon-Enabler
-  #   device_name: "%FIRST_NAME%'s%DUPE_STRATEGY_1ST% Hisense" # KS964, Build/RP1A.201005.001
-  #   device_serial: '8e3ddf49ee384247'
-
-  # old5:
-  #   domain: Device
-  #   app_name: com.amazon.amazonvideo.livingroom
-  #   app_version: '1.1'
-  #   device_model: Hisense
-  #   os_version: '6.0.1' #6.10.19
-  #   device_type: 'A3REWRVYBYPKUM'
-  #   device_name: '%FIRST_NAME%''s%DUPE_STRATEGY_1ST% Hisense'
-  #   device_serial: 'cd24294bffb75a46' # os.urandom(8).hex()
-    
   default:
     domain: Device
-    app_name: com.amazon.amazonvideo.livingroom
-    app_version: '1.4'
-    device_model: 'MTC'
-    os_version: '6.0.1' #6.10.19
-    device_type: 'A2HYAJ0FEWP6N3'
-    device_name: '%FIRST_NAME%''s%DUPE_STRATEGY_1ST% MTC'
-    device_serial: 'e6eb1ecdc8e34320'
-
-#Hisense_HU32E5600FHWV:  A2RGJ95OVLR12U
-#Hisense_HU50A6100UW:  AAJ692ZPT1X85
-#Hisense_HE55A700EUWTS:  A3REWRVYBYPKUM
-#MTC_ATV: A2HYAJ0FEWP6N3
+    app_name: 'com.amazon.amazonvideo.livingroom'
+    app_version: '7.3.4'
+    device_model: 'SHIELD Android TV'
+    device_name: "%FIRST_NAME%'s%DUPE_STRATEGY_1ST% Shield TV"
+    os_version: '28'
+    device_type: 'A1KAXIG6VXSG8Y'
+    device_serial: '9a4740e6fa227483'
+    software_version: '248'
 
 device_types:
   browser: 'AOAGZA014O5RE'  # all browsers? all platforms?
@@ -104,19 +61,18 @@ endpoints:
   browse: '/cdp/catalog/Browse'
   details: '/gp/video/api/getDetailPage'
   getDetailWidgets: '/gp/video/api/getDetailWidgets'
-  playback: '/cdp/catalog/GetPlaybackResources'
-  licence: '/cdp/catalog/GetPlaybackResources'
+  playback: '/playback/prs/GetVodPlaybackResources'
+  metadata: '/api/enrichItemMetadata'
+  licence: '/playback/drm-vod/GetWidevineLicense'
+  licence_pr: '/playback/drm-vod/GetPlayReadyLicense'
   # chapters/scenes
   xray: '/swift/page/xray'
   # device registration
-  ontv: '/region/eu/ontv/code?ref_=atv_auth_red_aft' #/gp/video/ontv/code
-  ontvold: '/gp/video/ontv/code/ref=atv_device_code'
-  mytv: '/mytv'
+  ontv: '/gp/video/ontv/code'
   devicelink: '/gp/video/api/codeBasedLinking'
   codepair: '/auth/create/codepair'
   register: '/auth/register'
   token: '/auth/token'
-  #cookies: '/ap/exchangetoken/cookies'
 
 regions:
   us:
@@ -130,6 +86,12 @@ regions:
     base_api: 'api.amazon.co.uk'
     base_manifest: 'atv-ps-eu.amazon.co.uk'
     marketplace_id: 'A2IR4J4NTCP2M5'  # A1F83G8C2ARO7P is also another marketplace_id
+
+  es:
+    base: 'www.amazon.es'
+    base_api: 'api.amazon.es'
+    base_manifest: 'atv-ps-eu.primevideo.com'
+    marketplace_id: 'A1RKKUPIHCS9HS'
 
   it:
     base: 'www.amazon.it'

@@ -1,7 +1,7 @@
 # U-NEXT(유넥스트)
 
 ```
-uv run unshackle dl --list -vl all -al orig -sl all -q 2160 -v h.265 -r HDR10 UNXT SID0087607
+uv run envied.dl --list -vl all -al orig -sl all -q 2160 -v h.265 -r HDR10 UNXT SID0087607
 ```
 
 ## Information

@@ -32,7 +32,7 @@ from . import queries
 class DSNP(Service):
     """
     Service code for Disney+ Streaming Service (https://disneyplus.com).\n
-    Version: 26.02.27
+    Version: 26.03.28
 
     Author: Made by CodeName393 with Special Thanks to narakama, Sam\n
     Authorization: Credentials, Web Token\n
@@ -575,7 +575,10 @@ class DSNP(Service):
         if self.tier_unlimits:
             parsed_url = urlparse(manifest_url)
             manifest_url = urlunparse(parsed_url._replace(query=""))  # Delete tier params
-        self.log.debug(f" + Manifest URL: {manifest_url}")
+
+        log_level = self.config.get("preferences", {}).get("manifest_log", "debug").lower()
+        log_func = getattr(self.log, log_level, self.log.debug)
+        log_func(f" + Manifest URL: {manifest_url}")
         tracks = HLS.from_url(url=manifest_url, session=self.session).to_tracks(title.language)
 
         artwork_type = "background" if isinstance(title, Movie) else "thumbnail"
@@ -610,7 +613,7 @@ class DSNP(Service):
             if audio.channels == 6.0:
                 audio.channels = 5.1
             if audio.channels == 10.0:  # DTS-UHD
-                audio.channels = "5.1.4"  # Unshackle does not recommend
+                audio.channels = "5.1.4"  # envied.does not recommend
                 audio.codec = Audio.Codec.DTS
                 audio.drm = None  # It need HW decording
 
@@ -623,7 +626,7 @@ class DSNP(Service):
         try:
             editorial = self.playback_data[title.id]["editorial"]
             if not editorial:
-                return Chapters()
+                return []
 
             LABEL_MAP = {
                 "intro_start": "intro_start",
