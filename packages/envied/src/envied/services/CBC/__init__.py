@@ -230,12 +230,7 @@ class CBC(Service):
     # Service specific
 
     def _show(self, data: dict) -> list[Episode]:
-        #lineups: list = next((x["lineups"] for x in data["content"] if x.get("title", "").lower() == "episodes"), None)
-        #if not lineups:
-        #    try:
-        #        lineups = next(x["lineups"] for x in data["content"] if x.get("title", "").lower() == "parts")
-        #    except StopIteration:
-        #        pass
+        
         lineups = next(
             (
                 x["lineups"]
