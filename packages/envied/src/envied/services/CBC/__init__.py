@@ -156,9 +156,7 @@ class CBC(Service):
         if label in ("film", "movie", "standalone"):
             movies: list[Movie] = self._movie(data)
             return Movies(movies)
-        elif label in ("parts"):
-            episodes: list[Episode] = self._show(data)
-            return Series(episodes)
+ 
         else:
             episodes: list[Episode] = self._show(data)
             return Series(episodes)
@@ -230,7 +228,7 @@ class CBC(Service):
     # Service specific
 
     def _show(self, data: dict) -> list[Episode]:
-        
+
         lineups = next(
             (
                 x["lineups"]
