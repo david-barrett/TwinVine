@@ -156,7 +156,9 @@ class CBC(Service):
         if label in ("film", "movie", "standalone"):
             movies: list[Movie] = self._movie(data)
             return Movies(movies)
-
+        elif label in ("parts"):
+            episodes: list[Episode] = self._show(data)
+            return Series(episodes)
         else:
             episodes: list[Episode] = self._show(data)
             return Series(episodes)
@@ -229,6 +231,12 @@ class CBC(Service):
 
     def _show(self, data: dict) -> list[Episode]:
         lineups: list = next((x["lineups"] for x in data["content"] if x.get("title", "").lower() == "episodes"), None)
+        if not lineups:
+            try:
+                lineups = next(x["lineups"] for x in data["content"] if x.get("title", "").lower() == "parts")
+            except StopIteration:
+                pass
+
         if not lineups:
             self.log.warning("No episodes found for: {}".format(data.get("title")))
             return
