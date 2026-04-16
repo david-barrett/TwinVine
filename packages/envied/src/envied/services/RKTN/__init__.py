@@ -428,7 +428,7 @@ class RKTN(Service):
         self.log.info(f"Searching for additional H.264 video tracks (pattern: {codec_prefix})...")
         
 
-        # Usar el directorio temp de Unshackle
+        # Usar el directorio temp de.envied
         temp_file = os.path.join(str(config.directories.temp), "video_test.mp4")
     
         
@@ -514,7 +514,7 @@ class RKTN(Service):
         # Codecs a probar (en orden de preferencia)
         codecs_to_try = ["ec-3", "ac-3", "dts", "mp4a"]
         
-        # Usar el directorio temp de Unshackle
+        # Usar el directorio temp de.envied
         temp_file = os.path.join(str(config.directories.temp), "audio_test.mp4")
     
         
