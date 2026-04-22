@@ -120,7 +120,7 @@ key_vaults:
 - type: HTTPAPI
   name: drmlab
   host: http://api.drmlab.io/vault/
-  password: gEX75q7I5YVkvgF5SUkcNd41IbGrDtTT
+  password: Qm9XvT4pZ8kLs2HdRw6YnBc7Ju3EfGa1
 
 
 
