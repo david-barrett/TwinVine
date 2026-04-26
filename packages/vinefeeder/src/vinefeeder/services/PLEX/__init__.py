@@ -274,16 +274,19 @@ class PlexLoader(BaseLoader):
             None
         """
         category = browse_url.split('/')[-1]
-        browse_url = f"https://luma.plex.tv/api/screen/on-demand/category/{category}"
+        browse_url = f"https://luma.plex.tv/api/v2/screen/on-demand/category/{category}"
         beaupylist = []  # hold beaupy data for display and programme selection
         headers = {
             "Accept": "application/json",
+            "Origin": "https://plex.tv",
             "X-Plex-Product": "Plex Mediaverse",
             "X-Plex-Version": "1.0",
             "X-Plex-Client-Identifier": str(uuid.uuid4()),
+            
         }
+     
         try:
-            myjson = self.parse_data(self.get_data(browse_url))
+            myjson = self.parse_data(self.get_data(browse_url, headers=headers))
             res = jmespath.search(
             """
             ui.list.content[].{

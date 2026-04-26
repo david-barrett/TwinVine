@@ -4,6 +4,7 @@ Downloads
 Temp/
 packages/envied/src/envied/logs/
 packages/envied/src/envied/envied.yaml
+packages/envied/src/envied/cache/TVNZ/local_storage.jsonv
 images/*
 tools/
 batch.txt

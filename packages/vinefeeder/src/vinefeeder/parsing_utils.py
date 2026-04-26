@@ -1,4 +1,5 @@
 import json
+from typing import List, Tuple
 from scrapy import Selector
 
 catppuccin_mocha = {
@@ -209,6 +210,31 @@ def extract_with_xpath(html, pattern, delete_pattern=None, index=0):
         print(f"Unexpected error: {e}")
         return None
 
+
+
+def extract_aria_label_and_href(html: str) -> List[Tuple[str, str]]:
+    """
+    Extract (aria-label, href) pairs from <a> tags in the supplied HTML.
+
+    Args:
+        html: Full HTML document as a string.
+
+    Returns:
+        A list of tuples in the form:
+        [
+            ("The Boondock Saints (1999)", "/en-GB/movie/the-boondock-saints"),
+            ...
+        ]
+    """
+    selector = Selector(text=html)
+
+    results = []
+    for a in selector.css("a[aria-label][href]"):
+        aria_label = a.attrib.get("aria-label", "").strip()
+        href = a.attrib.get("href", "").strip()
+        results.append((aria_label, href))
+
+    return results
 
 def rinse(string):
     """Remove non-printable characters from a string."""
