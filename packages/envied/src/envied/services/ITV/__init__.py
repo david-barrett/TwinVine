@@ -11,6 +11,7 @@ from typing import Any, Optional, Union
 import click
 from bs4 import BeautifulSoup
 from click import Context
+from envied.core.cdm.detect import is_playready_cdm
 from envied.core.credential import Credential
 from envied.core.manifests.dash import DASH
 from envied.core.search_result import SearchResult
@@ -24,11 +25,16 @@ class ITV(Service):
     Service code for ITVx streaming service (https://www.itv.com/).
 
     \b
-    Version: 1.0.3
+    Version: 1.0.4
     Author: stabbedbybrick
     Authorization: Cookies (Optional for free content | Required for premium content)
     Robustness:
-      L3: 1080p
+      Widevine:
+        L1: 1080p
+        L3: 720p
+      PlayReady:
+        SL3000: 1080p
+        SL2000: 720p
 
     \b
     Tips:
@@ -44,11 +50,6 @@ class ITV(Service):
         - SERIES: devine dl -w s01e01 itv https://www.itv.com/watch/bay-of-fires/10a5270
         - EPISODE: devine dl itv https://www.itv.com/watch/bay-of-fires/10a5270/10a5270a0001
         - FILM: devine dl itv https://www.itv.com/watch/mad-max-beyond-thunderdome/2a7095
-
-    \b
-    Notes:
-        ITV seem to detect and throttle multiple connections against the server.
-        It's recommended to use requests as downloader, with few workers.
 
     """
 
@@ -69,6 +70,10 @@ class ITV(Service):
         self.profile = ctx.parent.params.get("profile")
         if not self.profile:
             self.profile = "default"
+
+        self.cdm = ctx.obj.cdm
+        self.drm_system = "playready" if is_playready_cdm(self.cdm) else "widevine"
+        self.security_level = f"SL{self.cdm.security_level}" if self.drm_system == "playready" else f"L{self.cdm.security_level}"
 
         self.session.headers.update(self.config["headers"])
 
@@ -261,15 +266,15 @@ class ITV(Service):
                 "player": "dash",
                 "featureset": [
                     "mpeg-dash",
-                    "widevine",
+                    self.drm_system,
                     "outband-webvtt",
                     "hd",
                     "single-track",
                 ],
                 "platformTag": "ctv",
                 "drm": {
-                    "system": "widevine",
-                    "maxSupported": "L3",
+                    "system": self.drm_system,
+                    "maxSupported": self.security_level,
                 },
             },
         }
@@ -323,6 +328,12 @@ class ITV(Service):
         return None
 
     def get_widevine_license(self, challenge: bytes, **_: Any) -> bytes:
+        r = self.session.post(url=self.license, data=challenge)
+        if r.status_code != 200:
+            raise ConnectionError(r.text)
+        return r.content
+    
+    def get_playready_license(self, challenge: bytes, **_: Any) -> bytes:
         r = self.session.post(url=self.license, data=challenge)
         if r.status_code != 200:
             raise ConnectionError(r.text)

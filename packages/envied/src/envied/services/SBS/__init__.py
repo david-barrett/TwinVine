@@ -4,18 +4,20 @@ import hashlib
 import json
 import re
 from collections.abc import Generator
+from http.cookiejar import MozillaCookieJar
+from typing import Any, Optional
 from urllib.parse import urljoin, urlparse
-from typing import Any
 
 import click
+import jwt
 from click import Context
 from requests import Request
+from envied.core.credential import Credential
 from envied.core.manifests import HLS
 from envied.core.search_result import SearchResult
 from envied.core.service import Service
 from envied.core.titles import Episode, Movie, Movies, Series
 from envied.core.tracks import Chapters, Subtitle, Tracks
-from envied.core.utils.xml import load_xml
 
 
 class SBS(Service):
@@ -24,9 +26,9 @@ class SBS(Service):
     Service code for SBS ondemand streaming service (https://www.sbs.com.au/ondemand/).
 
     \b
-    Version: 1.0.1
+    Version: 1.0.2
     Author: stabbedbybrick
-    Authorization: None
+    Authorization: Credentials
     Geofence: AU (API and downloads)
     Robustness:
       AES: 720p, AAC2.0
@@ -38,11 +40,6 @@ class SBS(Service):
           EPISODE: https://www.sbs.com.au/ondemand/tv-series/reckless/season-1/reckless-s1-ep1/2459384899653
           MOVIE: https://www.sbs.com.au/ondemand/movie/silence/1363535939614
           SPORT: https://www.sbs.com.au/ondemand/sports-series/australian-championship-2025/football-australian-championship-2025/australian-championship-2025-s2025-ep40/2457638979614
-
-    \b
-    Notes:
-        - SBS uses transport streams for HLS, meaning the video and audio are a part of the same stream.
-          As a result only videos are listed as tracks, but the audio will be included as well.
 
     """
 
@@ -60,6 +57,51 @@ class SBS(Service):
         super().__init__(ctx)
 
         self.session.headers.update(self.config["headers"])
+
+    def authenticate(self, cookies: Optional[MozillaCookieJar] = None, credential: Optional[Credential] = None) -> None:
+        super().authenticate(cookies, credential)
+        if not credential:
+            raise EnvironmentError("Service requires Credentials for Authentication.")
+
+        cache = self.cache.get(f"tokens_{credential.sha1}")
+
+        if cache and not cache.expired:
+            self.log.info(" + Using cached tokens")
+            tokens = cache.data
+        elif cache and cache.expired:
+            self.log.info("Refreshing cached tokens...")
+            payload = {
+                "refreshToken": cache.data["refreshToken"],
+                "deviceName": "Android TV",
+                "refreshTokenInBody": True,
+            }
+
+            r = self.session.post(
+                self.config["endpoints"]["refresh"],
+                json=payload,
+            )
+            r.raise_for_status()
+            tokens = r.json()
+            expiry = jwt.decode(tokens.get("accessToken"), options={"verify_signature": False}).get("exp")
+            cache.set(tokens, expiration=expiry - 60)
+        else:
+            self.log.info(" + Logging in...")
+            payload = {
+                "email": credential.username,
+                "password": credential.password,
+                "deviceName": "Android TV",
+                "refreshTokenInBody": True,
+            }
+
+            response = self.session.post(
+                self.config["endpoints"]["auth"], json=payload
+            )
+            response.raise_for_status()
+            tokens = response.json()
+            expiry = jwt.decode(tokens.get("accessToken"), options={"verify_signature": False}).get("exp")
+            cache.set(tokens, expiration=expiry - 60)
+
+        self.session.headers.update({"Authorization": "Bearer {}".format(tokens["accessToken"])})
 
     def search(self) -> Generator[SearchResult, None, None]:
         params = {
@@ -88,7 +130,7 @@ class SBS(Service):
     def get_titles(self) -> Movies | Series:
         regex = re.compile(
             r"^https://www.sbs.com.au/ondemand/"
-            r"(?P<entity>tv-series|tv-program|sports-series|movie|watch)"
+            r"(?P<entity>tv-series|tv-program|sports-series|sports-program|movie|watch)"
             r"(?:/|/.*/)"
             r"(?P<id>[^/]+)/?$"
         )
@@ -99,7 +141,7 @@ class SBS(Service):
 
         entity_type, entity_id = (match.group(i) for i in ("entity", "id"))
 
-        if entity_type in ("movie", "tv-program") and entity_id.isdigit():
+        if entity_type in ("movie", "tv-program", "sports-program") and entity_id.isdigit():
             movie = self._movie(entity_id)
             return Movies(movie)
         
@@ -112,28 +154,39 @@ class SBS(Service):
             return Series(episodes)
 
     def get_tracks(self, title: Movie | Episode) -> Tracks:
-        smil = self._request("GET", f"/api/v3/video_smil?id={title.id}")
+        json_data = {
+            "deviceClass": "androidtv",
+            "advertising": {
+                "headerBidding": True,
+                "telariaID": "",
+                "subtitle": "en",
+                "resume": False,
+            },
+            "streamOptions": {
+                "audio": "demuxed",
+            },
+        }
+        content = self._request("POST", f"{self.config['endpoints']['playback']}/{title.id}", json=json_data)
+        provider = next((x for x in content.get("streamProviders", []) if x.get("type", "").lower() == "hls"), None)
 
-        body = load_xml(smil).find("body").find("seq")
-        section = body.find("par") or body
+        if not provider:
+            raise ValueError("Unable to find manifest for this title")
 
-        manifest = next((x.get("src") for x in section.findall("video")), None)
-        subtitles = [(x.get("src"), x.get("lang"), x.get("type")) for x in section.findall("textstream")]
-        
+        manifest = provider.get("url")
         tracks = HLS.from_url(manifest, self.session).to_tracks(title.language)
 
-        if subtitles:
-            for url, lang, type in subtitles:
-                if "ttaf+xml" in type:
-                    continue
-                codec = type.split("/")[-1]
+        if subtitles := provider.get("textTracks", []):
+            for subtitle in subtitles:
+                url = subtitle.get("url")
+                lang = subtitle.get("lang")
+                codec = subtitle.get("url").split(".")[-1]
                 tracks.add(
                     Subtitle(
                         id_=hashlib.md5(url.encode()).hexdigest()[0:6],
                         url=url,
-                        codec=Subtitle.Codec.from_mime(codec),
+                        codec=Subtitle.Codec.from_codecs(codec),
                         language=lang,
-                        sdh="_CC" in url,
+                        sdh="CC" in subtitle.get("name", ""),
                     )
                 )
 
