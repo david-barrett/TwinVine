@@ -137,11 +137,11 @@ class KNPY(Service):
 
         for result in data.get("list", []):
             yield SearchResult(
-                id_=f"/video/{result.get("videoId")}",
+                id_=f"/video/{result.get('videoId')}",
                 title=result.get("title"),
                 description=result.get("tagline"),
                 label="Video",
-                url=f"/video/{result.get("videoId")}",
+                url=f"/video/{result.get('videoId')}",
             )
 
     def get_titles(self) -> Movies | Series:
