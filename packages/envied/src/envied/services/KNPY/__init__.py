@@ -1,407 +1,396 @@
-import base64
-import json
+from __future__ import annotations
+
+import hashlib
 import re
-from datetime import datetime, timezone
-from http.cookiejar import CookieJar
-from typing import List, Optional
+from collections.abc import Generator
+from http.cookiejar import MozillaCookieJar
+from typing import Any, Optional
 
 import click
 import jwt
+from click import Context
 from langcodes import Language
-
-from envied.core.constants import AnyTrack
 from envied.core.credential import Credential
-from envied.core.manifests import DASH
+from envied.core.manifests import DASH, HLS
 from envied.core.search_result import SearchResult
 from envied.core.service import Service
-from envied.core.titles import Episode, Movie, Movies, Series, Title_T, Titles_T
-from envied.core.tracks import Subtitle, Tracks
+from envied.core.titles import Episode, Movie, Movies, Series
+from envied.core.tracks import Chapters, Subtitle, Tracks
 
 
 class KNPY(Service):
     """
-    Service code for Kanopy (kanopy.com).
-    Version: 1.0.0
+    \b
+    Service code for Kanopy streaming service (https://www.kanopy.com/).
 
-    Auth: Credential (username + password)
-    Security: FHD@L3
+    \b
+    Version: 1.0.1
+    Author: stabbedbybrick
+    Authorization: Credentials
+    Geofence: None
+    Robustness:
+      widevine:
+        L3: 1080p
+      playready:
+        SL2000: 1080p
 
-    Handles both Movies and Series (Playlists).
-    Detects and stops for movies that require tickets.
-    Caching included
+    \b
+    Tips:
+        - Input can be complete title URL or video path:
+          MOVIE: https://www.kanopy.com/en/lapl/video/16239510 OR /video/16239510 OR /product/16239510
+          SERIES: https://www.kanopy.com/en/lapl/video/14949910 OR /video/14949910 OR /product/14949910
+          EPISODE: https://www.kanopy.com/en/lapl/video/14949910/14949912 OR /video/14949910/14949912
+
+    \b
+    Notes:
+        - Available tickets are checked on each run, but they don't appear to be used
+          when titles are accessed through the API.
+
     """
 
-    # Updated regex to match the new URL structure with library subdomain and path
-    TITLE_RE = r"^https?://(?:www\.)?kanopy\.com/.+/(?P<id>\d+)$"
-    GEOFENCE = ()
-    NO_SUBTITLES = False
+    # GEOFENCE = ()
+    ALIASES = ("kanopy",)
+    TITLE_RE = r"^(?:.*?/)?(?P<type>watch/video|video|watch|product)/(?P<id1>\d+)(?:/(?P<id2>\d+))?/?$"
 
     @staticmethod
-    @click.command(name="KNPY", short_help="https://kanopy.com")
+    @click.command(name="KNPY", short_help="https://www.kanopy.com/", help=__doc__)
     @click.argument("title", type=str)
     @click.pass_context
-    def cli(ctx, **kwargs):
+    def cli(ctx: Context, **kwargs: Any) -> KNPY:
         return KNPY(ctx, **kwargs)
 
-    def __init__(self, ctx, title: str):
+    def __init__(self, ctx: Context, title: str):
+        self.title = title
         super().__init__(ctx)
-        if not self.config:
-            raise ValueError("KNPY configuration not found. Ensure config.yaml exists.")
-        
-        self.cdm = ctx.obj.cdm
 
-        match = re.match(self.TITLE_RE, title)
-        if match:
-            self.content_id = match.group("id")
-        else:
-            self.content_id = None
-            self.search_query = title
-        
-        self.API_VERSION = self.config["client"]["api_version"]
-        self.USER_AGENT = self.config["client"]["user_agent"]
-        self.WIDEVINE_UA = self.config["client"]["widevine_ua"]
+        self.session.headers.update(self.config["headers"])
 
-        self.session.headers.update({
-            "x-version": self.API_VERSION,
-            "user-agent": self.USER_AGENT
-        })
+    def authenticate(self, cookies: Optional[MozillaCookieJar] = None, credential: Optional[Credential] = None) -> None:
+        super().authenticate(cookies, credential)
+        if not credential:
+            raise EnvironmentError("Service requires Credentials for Authentication.")
 
-        self._jwt = None
-        self._visitor_id = None
-        self._user_id = None
-        self._domain_id = None
-        self.widevine_license_url = None
+        cache = self.cache.get(f"tokens_{credential.sha1}")
 
-    def authenticate(self, cookies: Optional[CookieJar] = None, credential: Optional[Credential] = None) -> None:
-        if not credential or not credential.username or not credential.password:
-            raise ValueError("Kanopy requires email and password for authentication.")
-
-        cache = self.cache.get("auth_token")
-        
         if cache and not cache.expired:
-            cached_data = cache.data
-            valid_token = None
-
-            if isinstance(cached_data, dict) and "token" in cached_data:
-                if cached_data.get("username") == credential.username:
-                    valid_token = cached_data["token"]
-                    self.log.info("Using cached authentication token")
-                else:
-                    self.log.info(f"Cached token belongs to '{cached_data.get('username')}', but logging in as '{credential.username}'. Re-authenticating.")
-            
-            elif isinstance(cached_data, str):
-                self.log.info("Found legacy cached token format. Re-authenticating to ensure correct user.")
-            
-            if valid_token:
-                self._jwt = valid_token
-                self.session.headers.update({"authorization": f"Bearer {self._jwt}"})
-
-                if not self._user_id or not self._domain_id or not self._visitor_id:
-                    try:
-                        decoded_jwt = jwt.decode(self._jwt, options={"verify_signature": False})
-                        self._user_id = decoded_jwt["data"]["uid"]
-                        self._visitor_id = decoded_jwt["data"]["visitor_id"]
-                        self.log.info(f"Extracted user_id and visitor_id from cached token.")
-                        self._fetch_user_details()
-                        return 
-                    except (KeyError, jwt.DecodeError) as e:
-                        self.log.error(f"Could not decode cached token: {e}. Re-authenticating.")
-                        
-        self.log.info("Performing handshake to get visitor token...")
-        r = self.session.get(self.config["endpoints"]["handshake"])
-        r.raise_for_status()
-        handshake_data = r.json()
-        self._visitor_id = handshake_data["visitorId"]
-        initial_jwt = handshake_data["jwt"]
-
-        self.log.info(f"Logging in as {credential.username}...")
-        login_payload = {
-            "credentialType": "email",
-            "emailUser": {
-                "email": credential.username,
-                "password": credential.password
-            }
-        }
-        r = self.session.post(
-            self.config["endpoints"]["login"],
-            json=login_payload,
-            headers={"authorization": f"Bearer {initial_jwt}"}
-        )
-        r.raise_for_status()
-        login_data = r.json()
-        self._jwt = login_data["jwt"]
-        self._user_id = login_data["userId"]
-        
-        self.session.headers.update({"authorization": f"Bearer {self._jwt}"})
-        self.log.info(f"Successfully authenticated as {credential.username}")
-
-        self._fetch_user_details()
-
-        try:
-            decoded_jwt = jwt.decode(self._jwt, options={"verify_signature": False})
-            exp_timestamp = decoded_jwt.get("exp")
-            
-            cache_payload = {
-                "token": self._jwt,
-                "username": credential.username
-            }
-
-            if exp_timestamp:
-                expiration_in_seconds = int(exp_timestamp - datetime.now(timezone.utc).timestamp())
-                self.log.info(f"Caching token for {expiration_in_seconds / 60:.2f} minutes.")
-                cache.set(data=cache_payload, expiration=expiration_in_seconds)
-            else:
-                self.log.warning("JWT has no 'exp' claim, caching for 1 hour as a fallback.")
-                cache.set(data=cache_payload, expiration=3600)
-        except Exception as e:
-            self.log.error(f"Failed to decode JWT for caching: {e}. Caching for 1 hour as a fallback.")
-            cache.set(
-                data={"token": self._jwt, "username": credential.username}, 
-                expiration=3600
-            )
-
-    def _fetch_user_details(self):
-        self.log.info("Fetching user library memberships...")
-        r = self.session.get(self.config["endpoints"]["memberships"].format(user_id=self._user_id))
-        r.raise_for_status()
-        memberships = r.json()
-
-        for membership in memberships.get("list", []):
-            if membership.get("status") == "active" and membership.get("isDefault", False):
-                self._domain_id = str(membership["domainId"])
-                self.log.info(f"Using default library domain: {membership.get('sitename', 'Unknown')} (ID: {self._domain_id})")
-                return
-        
-        if memberships.get("list"):
-            self._domain_id = str(memberships["list"][0]["domainId"])
-            self.log.warning(f"No default library found. Using first active domain: {self._domain_id}")
+            self.log.info(" + Using cached tokens")
+            tokens = cache.data
         else:
-            raise ValueError("No active library memberships found for this user.")
+            self.log.info(" + Logging in...")
+            payload = {
+                "credentialType": "email",
+                "emailUser": {
+                    "email": credential.username,
+                    "password": credential.password,
+                },
+            }
 
-    def get_titles(self) -> Titles_T:
-        if not self.content_id:
-            raise ValueError("A content ID is required to get titles. Use a URL or run a search first.")
-        if not self._domain_id:
-            raise ValueError("Domain ID not set. Authentication may have failed.")
-
-        r = self.session.get(self.config["endpoints"]["video_info"].format(video_id=self.content_id, domain_id=self._domain_id))
-        r.raise_for_status()
-        content_data = r.json()
-        
-        content_type = content_data.get("type")
-        
-        def parse_lang(data):
-            try:
-                langs = data.get("languages", [])
-                if langs and isinstance(langs, list) and len(langs) > 0:
-                    return Language.find(langs[0]) 
-            except:
-                pass
-            return Language.get("en")
-
-        if content_type == "video":
-            video_data = content_data["video"]
-            movie = Movie(
-                id_=str(video_data["videoId"]),
-                service=self.__class__,
-                name=video_data["title"],
-                year=video_data.get("productionYear"),
-                description=video_data.get("descriptionHtml", ""),
-                language=parse_lang(video_data),
-                data=video_data,
+            response = self.session.post(
+                self.config["endpoints"]["login"], json=payload
             )
-            return Movies([movie])
+            response.raise_for_status()
+            data = response.json()
 
-        elif content_type == "playlist":
-            playlist_data = content_data["playlist"]
-            series_title = playlist_data["title"]
-            series_year = playlist_data.get("productionYear")
+            if not (access_token := data.get("jwt")):
+                raise ConnectionError(f"Failed to login: {data}")
             
-            season_match = re.search(r'(?:Season|S)\s*(\d+)', series_title, re.IGNORECASE)
-            season_num = int(season_match.group(1)) if season_match else 1
+            user_id = data.get("userId")
 
-            r = self.session.get(self.config["endpoints"]["video_items"].format(video_id=self.content_id, domain_id=self._domain_id))
-            r.raise_for_status()
-            items_data = r.json()
+            expiry = jwt.decode(access_token, options={"verify_signature": False}).get("exp")
+            if not expiry:
+                expiry = 86400 # 24 hour fallback
 
-            episodes = []
-            for i, item in enumerate(items_data.get("list", [])):
-                if item.get("type") != "video":
+            tokens = {
+                "accessToken": access_token,
+                "userId": user_id,
+            }
+            
+            cache.set(tokens, expiration=expiry - 3600)
+
+        user = self._get_membership(tokens.get("accessToken"), tokens.get("userId"))
+
+        self.subdomain = user.get("subdomain", "lapl")
+        self.site = user.get("sitename")
+        self.domain_id = user.get("domainId")
+        self.available_tickets = user.get("ticketsAvailable", 0)
+
+        self.log.info(f"Site: {self.site} | Available tickets: {self.available_tickets}")
+
+        self.user_id = tokens.get("userId")
+        self.access_token = tokens.get("accessToken")
+        self.session.headers.update({"authorization": "Bearer {}".format(self.access_token)})
+
+    def search(self) -> Generator[SearchResult, None, None]:
+        params = {
+            "query": self.title,
+            "sort": "relevance",
+            "rfp": "exclude",
+            "domainId": self.domain_id,
+            "isKids": "false",
+            "page": "0",
+            "perPage": "40",
+        }
+
+        response = self.session.get(self.config["endpoints"]["search"], params=params)
+        response.raise_for_status()
+        data = response.json()
+
+        for result in data.get("list", []):
+            yield SearchResult(
+                id_=f"/video/{result.get("videoId")}",
+                title=result.get("title"),
+                description=result.get("tagline"),
+                label="Video",
+                url=f"/video/{result.get("videoId")}",
+            )
+
+    def get_titles(self) -> Movies | Series:
+        match = re.match(self.TITLE_RE, self.title)
+        if not match:
+            raise ValueError(f"Invalid title: {self.title}")
+
+        _, content_id, video_id = (match.group(i) for i in ("type", "id1", "id2"))
+
+        response = self.session.get(
+            self.config["endpoints"]["videos"].format(video_id=content_id),
+            params={"domainId": self.domain_id, "ageRatingDomainId": self.domain_id},
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        entity_type = data.get("type")
+        
+        if entity_type in ("video"):
+            movie = self._get_movie(data)
+            return Movies(movie)
+        
+        # listed as a single season
+        elif entity_type in ("playlist"):
+            episodes = self._get_playlist(data)
+            if video_id is not None:
+                episodes = [episode for episode in episodes if int(episode.id) == int(video_id)]
+            return Series(episodes)
+        
+        # listed as a collection of seasons
+        elif entity_type in ("collection"):
+            episodes = self._get_collection(data)
+            if video_id is not None:
+                episodes = [episode for episode in episodes if int(episode.id) == int(video_id)]
+            return Series(episodes)
+
+        else:
+            raise ValueError(f"Unsupported content type: {entity_type}")
+
+    def get_tracks(self, title: Movie | Episode) -> Tracks:
+        json_data = {
+            "videoId": title.id,
+            "userId": self.user_id,
+            "domainId": self.domain_id,
+        }
+
+        response = self.session.post(
+            self.config["endpoints"]["plays"],
+            headers={
+                "authorization": "Bearer {}".format(self.access_token),
+                **self.config["headers"],
+            },
+            json=json_data,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        manifests = data.get("manifests", [])
+
+        stream_data = next((m for m in manifests if m.get("manifestType") == "dash"), None)
+        stream_format = DASH
+
+        # Fallback to HLS
+        if not stream_data:
+            stream_data = next((m for m in manifests if m.get("manifestType") == "hls"), None)
+            stream_format = HLS
+
+        if not stream_data:
+            raise ValueError(f"Failed to find manifest for title: {title}")
+
+        manifest = stream_data.get("url")
+        title.data["drm_id"] = stream_data.get("drmLicenseID")
+
+        self.session.headers.clear()
+        tracks = stream_format.from_url(manifest, self.session).to_tracks(title.language)
+
+        for caption in data.get("captions", []):
+            language = caption.get("language")
+            for sub in caption.get("files", []):
+                if sub.get("type") == "transcript":
                     continue
-                
-                video_data = item["video"]
-                ep_num = i + 1
-                
-                ep_title = video_data.get("title", "")
-                ep_match = re.search(r'Ep(?:isode)?\.?\s*(\d+)', ep_title, re.IGNORECASE)
-                if ep_match:
-                    ep_num = int(ep_match.group(1))
 
-                episodes.append(
-                    Episode(
-                        id_=str(video_data["videoId"]),
-                        service=self.__class__,
-                        title=series_title,
-                        season=season_num,
-                        number=ep_num,
-                        name=video_data["title"],
-                        description=video_data.get("descriptionHtml", ""),
-                        year=video_data.get("productionYear", series_year),
-                        language=parse_lang(video_data),
-                        data=video_data,
+                tracks.add(
+                    Subtitle(
+                        id_=hashlib.md5(sub.get("url").encode()).hexdigest()[0:6],
+                        codec=Subtitle.Codec.from_codecs(sub.get("url").split(".")[-1]),
+                        language=language,
+                        url=sub.get("url"),
                     )
                 )
-            
-            series = Series(episodes)
-            series.name = series_title
-            series.description = playlist_data.get("descriptionHtml", "")
-            series.year = series_year
-            return series
-        
-        else:
-            raise ValueError(f"Unsupported content type: {content_type}")
 
-    def get_tracks(self, title: Title_T) -> Tracks:
-        play_payload = {
-            "videoId": int(title.id),
-            "domainId": int(self._domain_id),
-            "userId": int(self._user_id),
-            "visitorId": self._visitor_id
-        }
-
-        self.session.headers.setdefault("authorization", f"Bearer {self._jwt}")
-        self.session.headers.setdefault("x-version", self.API_VERSION)
-        self.session.headers.setdefault("user-agent", self.USER_AGENT)
-
-        r = self.session.post(self.config["endpoints"]["plays"], json=play_payload)
-        response_json = None
-        try:
-            response_json = r.json()
-        except Exception:
-            pass
-
-        # Handle known errors gracefully
-        if r.status_code == 403:
-            if response_json and response_json.get("errorSubcode") == "playRegionRestricted":
-                self.log.error("Kanopy reports: This video is not available in your country.")
-                raise PermissionError(
-                    "Playback blocked by region restriction. Try connecting through a supported country or verify your library’s access region."
-                )
-            else:
-                self.log.error(f"Access forbidden (HTTP 403). Response: {response_json}")
-                raise PermissionError("Kanopy denied access to this video. It may require a different library membership or authentication.")
-        
-        # Raise for any other HTTP errors
-        r.raise_for_status()
-        play_data = response_json or r.json()
-
-        manifest_url = None
-        for manifest in play_data.get("manifests", []):
-            if manifest["manifestType"] == "dash":
-                url = manifest["url"]
-                manifest_url = f"https://kanopy.com{url}" if url.startswith("/") else url
-                drm_type = manifest.get("drmType")
-                if drm_type == "kanopyDrm":
-                    play_id = play_data.get("playId")
-                    self.widevine_license_url = self.config["endpoints"]["widevine_license"].format(license_id=f"{play_id}-0")
-                elif drm_type == "studioDrm":
-                    license_id = manifest.get("drmLicenseID", f"{play_data.get('playId')}-1")
-                    self.widevine_license_url = self.config["endpoints"]["widevine_license"].format(license_id=license_id)
-                else:
-                    self.log.warning(f"Unknown drmType: {drm_type}")
-                    self.widevine_license_url = None
-                break
-
-        if not manifest_url:
-            raise ValueError("Could not find a DASH manifest for this title.")
-        if not self.widevine_license_url:
-            raise ValueError("Could not construct Widevine license URL.")
-
-        self.log.info(f"Fetching DASH manifest from: {manifest_url}")
-        r = self.session.get(manifest_url)
-        r.raise_for_status()
-
-        # Refresh headers for manifest parsing
-        self.session.headers.clear()
-        self.session.headers.update({
-            "User-Agent": self.WIDEVINE_UA,
-            "Accept": "*/*",
-            "Accept-Encoding": "gzip, deflate",
-            "Connection": "keep-alive",
-        })
-
-        tracks = DASH.from_text(r.text, url=manifest_url).to_tracks(language=title.language)
-        for caption_data in play_data.get("captions", []):
-            lang = caption_data.get("language", "en")
-            for file_info in caption_data.get("files", []):
-                if file_info.get("type") == "webvtt":
-                    tracks.add(Subtitle(
-                        id_=f"caption-{lang}",
-                        url=file_info["url"],
-                        codec=Subtitle.Codec.WebVTT,
-                        language=Language.get(lang)
-                    ))
-                    break
-                    
         return tracks
 
+    def get_chapters(self, title: Movie | Episode) -> Chapters:
+        return Chapters()
+    
+    def get_widevine_service_certificate(self, *, challenge: bytes, title: Episode | Movie, track: Any) -> bytes | str | None:
+        return None
 
-    def get_widevine_license(self, *, challenge: bytes, title: Title_T, track: AnyTrack) -> bytes:
-        if not self.widevine_license_url:
-            raise ValueError("Widevine license URL was not set. Call get_tracks first.")
-  
-        license_headers = {
-            "Content-Type": "application/octet-stream",
-            "User-Agent": self.WIDEVINE_UA,
-            "Authorization": f"Bearer {self._jwt}", 
-            "X-Version": self.API_VERSION
+    def get_widevine_license(self, *, challenge: bytes, title: Episode | Movie, track: Any) -> bytes | str | None:
+        if not (drm_id := title.data.get("drm_id")):
+            return None
+        
+        license_url = self.config["endpoints"]["widevine"].format(drm_id=drm_id)
+
+        headers = {
+            "authorization": "Bearer {}".format(self.access_token),
+            "content-type": "application/octet-stream",
+            **self.config["headers"]
         }
 
-        r = self.session.post(
-            self.widevine_license_url,
-            data=challenge,
-            headers=license_headers  
-        )
+        r = self.session.post(url=license_url, headers=headers, data=challenge)
         r.raise_for_status()
+
+        return r.content
+    
+    def get_playready_license(self, *, challenge: bytes, title: Episode | Movie, track: Any) -> bytes | str | None:
+        if not (drm_id := title.data.get("drm_id")):
+            return None
+        
+        license_url = self.config["endpoints"]["playready"].format(drm_id=drm_id)
+
+        headers = {
+            "authorization": "Bearer {}".format(self.access_token),
+            "content-type": "text/xml; charset=utf-8",
+            "SOAPAction": "http://schemas.microsoft.com/DRM/2007/03/protocols/AcquireLicense",
+            **self.config["headers"]
+        }
+
+        r = self.session.post(url=license_url, headers=headers, data=challenge)
+        r.raise_for_status()
+
         return r.content
 
-    # def search(self) -> List[SearchResult]:
-    #     if not hasattr(self, 'search_query'):
-    #         self.log.error("Search query not set. Cannot search.")
-    #         return []
-            
-    #     self.log.info(f"Searching for '{self.search_query}'...")
-    #     params = {
-    #         "query": self.search_query,
-    #         "sort": "relevance",
-    #         "domainId": self._domain_id,
-    #         "page": 0,
-    #         "perPage": 20
-    #     }
-    #     r = self.session.get(self.config["endpoints"]["search"], params=params)
-    #     r.raise_for_status()
-    #     search_data = r.json()
+    # Service-specific methods
 
-    #     results = []
-    #     for item in search_data.get("list", []):
-    #         item_type = item.get("type")
-    #         if item_type not in ["playlist", "video"]:
-    #             continue
+    def _get_playlist(self, data: dict) -> list[Episode]:
+        if not (metadata := data.get("playlist")):
+            self.log.error(" - Error: No metadata found for this title.")
+            return []
+        
+        series_title = metadata.get("title")
+        season = re.search(r"\b(?:S|Season|Series)\s*(\d+)", series_title, re.IGNORECASE)
+        season_number = int(season.group(1)) if season else 1
+        
+        response = self.session.get(
+            self.config["endpoints"]["items"].format(video_id=metadata.get("videoId")),
+            params={"domainId": self.domain_id, "ageRatingDomainId": self.domain_id}
+        )
+        if response.status_code != 200:
+            self.log.error(f" - Error: Failed to fetch playlist for ID: {metadata.get('videoId')} - {response.status_code}")
+            return []
+        
+        data = response.json()
 
-    #         video_id = item.get("videoId")
-    #         title = item.get("title", "No Title")
-    #         label = "Series" if item_type == "playlist" else "Movie"
-            
-    #         results.append(
-    #             SearchResult(
-    #                 id_=str(video_id),
-    #                 title=title,
-    #                 description="",
-    #                 label=label,
-    #                 url=f"https://www.kanopy.com/watch/{video_id}" 
-    #             )
-    #         )
-    #     return results
+        videos = []
+        for e, item in enumerate(data.get("list", [])):
+            if item.get("type", "").lower() != "video":
+                continue
 
-    def get_chapters(self, title: Title_T) -> list:
-        return []
+            episode = item.get("video", {})
+            if episode:
+                episode["number"] = e + 1
+            videos.append(episode)
+        
+        episodes = []
+        for video in videos:
+            lang = next((x.get("name") for x in video.get("taxonomies", {}).get("languages", [])), "English")
+            episodes.append(
+                Episode(
+                    id_=video.get("videoId"),
+                    service=self.__class__,
+                    title=series_title,
+                    season=season_number,
+                    number=video.get("number", 0),
+                    name=video.get("title"),
+                    year=video.get("productionYear"),
+                    language=Language.find(lang).to_alpha3(),
+                    data=video,
+                )
+            )
+
+        return episodes
+
+    def _get_collection(self, data: dict) -> list[Episode]:
+        if not (metadata := data.get("collection")):
+            self.log.error(" - Error: No metadata found for this title.")
+            return []
+        
+        series_title = metadata.get("title")
+        
+        response = self.session.get(
+            self.config["endpoints"]["items"].format(video_id=metadata.get("videoId")),
+            params={"domainId": self.domain_id, "ageRatingDomainId": self.domain_id}
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        playlists = [i for i in data.get("list", []) if i.get("type", "").lower() == "playlist"]
+        if not playlists:
+            self.log.error(" - Error: No playlists found for this title.")
+            return []
+        
+        episodes = []
+        for s, playlist in enumerate(playlists):
+            playlist_episodes = self._get_playlist(playlist)
+
+            for video in playlist_episodes:
+                video.title = series_title
+                video.season = video.season or s + 1
+
+            episodes.extend(playlist_episodes)
+        
+        return episodes
+        
+    def _get_movie(self, data: dict) -> list[Movie]:
+        if not (metadata := data.get("video")):
+            self.log.error(" - Error: No metadata found for this title.")
+            return []
+        
+        lang = next((x.get("name") for x in metadata.get("languages", [])), "English")
+
+        return [
+            Movie(
+                id_=metadata.get("videoId"),
+                service=self.__class__,
+                name=metadata.get("title"),
+                year=metadata.get("productionYear"),
+                language=Language.find(lang).to_alpha3(),
+                data=metadata,
+            )
+        ]
+    
+    def _get_membership(self, access_token: str, user_id: str) -> dict:
+        response = self.session.get(
+            self.config["endpoints"]["memberships"],
+            headers={"authorization": "Bearer {}".format(access_token)},
+            params={"userId": user_id},
+        )
+        response.raise_for_status()
+        data = response.json()
+        
+        user_info = next((i for i in data.get("list", []) if i.get("userId") == user_id), None)
+        if not user_info:
+            raise ValueError(f"Failed to get membership info for user: {data}")
+        
+        if user_info.get("status", "").lower() != "active":
+            raise ValueError(f"User is not active: {user_info}")
+        
+        return user_info
+
+

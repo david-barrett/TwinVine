@@ -1,15 +1,15 @@
-client:
-  api_version: "Android/com.kanopy/6.21.0/952 (SM-A525F; Android 15)"
-  user_agent: "okhttp/5.2.1"
-  widevine_ua: "KanopyApplication/6.21.0 (Linux;Android 15) AndroidXMedia3/1.8.0"
+headers:
+  user-agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+  x-version: "web/undefined/undefined/undefined"
 
 endpoints:
-  handshake: "https://kanopy.com/kapi/handshake"
-  login: "https://kanopy.com/kapi/login"
-  memberships: "https://kanopy.com/kapi/memberships?userId={user_id}"
-  video_info: "https://kanopy.com/kapi/videos/{video_id}?domainId={domain_id}"
-  video_items: "https://kanopy.com/kapi/videos/{video_id}/items?domainId={domain_id}"
-  search: "https://kanopy.com/kapi/search/videos"
-  plays: "https://kanopy.com/kapi/plays"
-  access_expires_in: "https://kanopy.com/kapi/users/{user_id}/history/videos/{video_id}/access_expires_in?domainId={domain_id}"
-  widevine_license: "https://kanopy.com/kapi/licenses/widevine/{license_id}"
+  login: "https://www.kanopy.com/kapi/login"
+  users: "https://www.kanopy.com/kapi/users/{user_id}"
+  memberships: "https://www.kanopy.com/kapi/memberships"
+  institutions: "https://www.kanopy.com/kapi/institutions/alias/{alias}"
+  search: "https://www.kanopy.com/kapi/search/videos"
+  videos: "https://www.kanopy.com/kapi/videos/{video_id}"
+  items: "https://www.kanopy.com/kapi/videos/{video_id}/items"
+  plays: "https://www.kanopy.com/kapi/plays"
+  widevine: "https://www.kanopy.com/kapi/licenses/widevine/{drm_id}"
+  playready: "https://www.kanopy.com/kapi/licenses/playready/{drm_id}"

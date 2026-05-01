@@ -18,7 +18,7 @@ tag_imdb_tmdb: true
 set_terminal_bg: false
 
 # Custom output templates for filenames
-# Configure output_template in your unshackle.yaml to control filename format.
+# Configure output_template in your envied.yaml to control filename format.
 # If not configured, default scene-style templates are used and a warning is shown.
 # Available variables: {title}, {year}, {season}, {episode}, {season_episode}, {episode_name},
 #                     {quality}, {resolution}, {source}, {audio}, {audio_channels}, {audio_full},
@@ -404,7 +404,7 @@ headers:
 filenames:
   debug_log: "unshackle_debug_{service}_{time}.jsonl" # JSON Lines debug log file
   config: "config.yaml"
-  root_config: "unshackle.yaml"
+  root_config: "envied.yaml"
   chapters: "Chapters_{title}_{random}.txt"
   subtitle: "Subtitle_{id}_{language}.srt"
 
