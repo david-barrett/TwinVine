@@ -21,7 +21,7 @@ class CRAV(Service):
     Service code for Bell Media's Crave streaming service (https://crave.ca).
 
     \b
-    Version: 1.0.0
+    Version: 1.0.1
     Author: stabbedbybrick
     Authorization: Credentials
     Geofence: CA (API and downloads)
@@ -275,11 +275,8 @@ class CRAV(Service):
         return sorted(chapters, key=lambda x: x.timestamp)
         
     def get_widevine_service_certificate(self, challenge: bytes, **_: Any) -> bytes | None:
-        if self.drm_system == "widevine":
-            return self.session.post(url=self.license_url, data=challenge).content
+        return self.session.post(url=self.config["endpoints"]["widevine"], data=challenge).content
         
-        return None
-    
     def get_widevine_license(self, *, challenge: bytes, title: Episode | Movie, track: Any, **kwargs) -> bytes | str | None:
         headers = {
             "Accept": "*/*",

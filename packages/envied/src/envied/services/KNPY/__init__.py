@@ -24,7 +24,7 @@ class KNPY(Service):
     Service code for Kanopy streaming service (https://www.kanopy.com/).
 
     \b
-    Version: 1.0.1
+    Version: 1.0.2
     Author: stabbedbybrick
     Authorization: Credentials
     Geofence: None
@@ -230,6 +230,7 @@ class KNPY(Service):
                         codec=Subtitle.Codec.from_codecs(sub.get("url").split(".")[-1]),
                         language=language,
                         url=sub.get("url"),
+                        sdh="CC" in caption.get("label", ""),
                     )
                 )
 
