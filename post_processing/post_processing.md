@@ -6,7 +6,12 @@ Using a post-processor on the downloaded results may provide a solution.
 
 I have found two unmet needs:
 
-* Extract srt subtitles
+* Extract srt subtitles 
+EDIT  There is now an envied option
+- mux: Embed subtitles in MKV container only (default)
+- sidecar: Save subtitles as separate files only
+- both: Embed in MKV AND save as sidecar files
+see the envied-working example.yaml and edit for your preference.
 * Convert mkv output to mp4 (or any other video container format, with code adjustment)
 
 Here are two scripts which operate from a root folder (downloads - for instance), and operate on all the mkv files found within. The original files are left in place - for you to remove as necessary.

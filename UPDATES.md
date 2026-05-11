@@ -1,5 +1,13 @@
 **Updates**
 
+ **11 May 2026**
+ Vinefeeder update to BBC UHD detection to enable automatic HLG selection.
+ Some service updates.
+
+ **Mar 2026**
+ Envied updated to match upstream to version 4.0.0
+ service updates
+
 **19 Jan 2026**
 
 - upstream envied to 2.3.0

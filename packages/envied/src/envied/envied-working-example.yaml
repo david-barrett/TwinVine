@@ -178,14 +178,38 @@ filenames:
 # API key for The Movie Database (TMDB)
 tmdb_api_key: ""
 
-# conversion_method:
-# - auto (default): Smart routing - subby for WebVTT/SAMI, standard for others
+#conversion_method:
+# - auto (default): Smart routing - subby for WebVTT/SAMI, pycaption for others
 # - subby: Always use subby with advanced processing
 # - pycaption: Use only pycaption library (no SubtitleEdit, no subby)
 # - subtitleedit: Prefer SubtitleEdit when available, fall back to pycaption
+# - pysubs2: Use pysubs2 library (supports SRT/SSA/ASS/WebVTT/TTML/SAMI/MicroDVD/MPL2/TMP)
 subtitle:
   conversion_method: auto
+  # sdh_method: Method to use for SDH (hearing impaired) stripping
+  # - auto (default): Try subby (SRT only), then SubtitleEdit (if available), then subtitle-filter
+  # - subby: Use subby library (SRT only)
+  # - subtitleedit: Use SubtitleEdit tool (Windows only, falls back to subtitle-filter)
+  # - filter-subs: Use subtitle-filter library directly
   sdh_method: auto
+  # strip_sdh: Automatically create stripped (non-SDH) versions of SDH subtitles
+  # Set to false to disable automatic SDH stripping entirely (default: true)
+  strip_sdh: true
+  # convert_before_strip: Auto-convert VTT/other formats to SRT before using subtitle-filter
+  # This ensures compatibility when subtitle-filter is used as fallback (default: true)
+  convert_before_strip: true
+  # preserve_formatting: Preserve original subtitle formatting (tags, positioning, styling)
+  # When true, skips pycaption processing for WebVTT files to keep tags like <i>, <b>, positioning intact
+  # Combined with no sub_format setting, ensures subtitles remain in their original format (default: true)
+  preserve_formatting: true
+  # output_mode: Output mode for subtitles
+  # - mux: Embed subtitles in MKV container only (default)
+  # - sidecar: Save subtitles as separate files only
+  # - both: Embed in MKV AND save as sidecar files
+  output_mode: mux
+  # sidecar_format: Format for sidecar subtitle files
+  # Options: srt, vtt, ass, original (keep current format)
+  sidecar_format: srt
 
 
 # Configuration data for each Service

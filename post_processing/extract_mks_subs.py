@@ -2,7 +2,7 @@
 """
 Selecting -S (subtitles only) as a download option results in an mks file
 which needs convertion to something acceptable for adding to a video playback.
-This is a post processing routne that operated in teh root foler of any number of
+This is a post processing routine that operates in the root folder of any number of
 mks files.
 The sceipt will recursively extract subtitle tracks from .mks files using mkvextract.
 

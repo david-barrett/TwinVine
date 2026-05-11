@@ -2,6 +2,8 @@
 """The BBC does not follow the same structures as most other srvices
 The BBC does not use  script = window.__PARAMS__ = ..."""
 
+from pydoc import html
+
 from vinefeeder.base_loader import BaseLoader
 from vinefeeder.parsing_utils import extract_params_json, parse_json, split, split_options
 from rich.console import Console
@@ -45,11 +47,20 @@ class BbcLoader(BaseLoader):
             list: A list of URLs with UHD content.
         """
 
-        uhd_url = "https://www.bbc.co.uk/iplayer/help/questions/programme-availability/uhd-content"
+        uhd_url = "https://www.bbc.co.uk/iplayer/help/questions/programme-availability/uhd-content/"
         html = self.get_data(uhd_url)
         sel = Selector(text=html)
-        uhd_list = sel.xpath("(//ul)[9]//a/text()").getall()
-        #url_list = sel.xpath("(//ul)[9]//a/@href").getall()
+
+        uhd_list = [
+            x.xpath("normalize-space(.)").get()
+            for x in sel.xpath(
+                '//main//*[self::h2 or self::h3 or self::p or self::strong]'
+                '[contains(normalize-space(.), "Full list of Ultra HD programmes") '
+                'or contains(normalize-space(.), "Full list of UHD programmes")]'
+                '/following::ul[1]/li'
+            )
+        ]
+                                
 
         return uhd_list
 

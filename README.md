@@ -58,7 +58,7 @@ uv run vinefeeder --help or
 uv run envied --help
 ```
 
-**Installation for Windows** with a bare machine and novice user.
+**Installation for Windows** with a bare machine and novice user. (Why not print out these instructions so you can tick them off as you work through them?)
 	
 You are going to install all the required binary files and automatically add then to system variable - Path.  The Python interpreter will be installed automatically too.
 
@@ -111,7 +111,9 @@ git clone https://github.com/vinefeeder/TwinVine.git
 	uv run envied dl -?
 	
 ```
-That's it for Windows; uv run vinefeeder to get started!  
+That's it for Windows; uv run vinefeeder OR uv run envied dl -? to get started!  
+Vinefeeder offers a graphical interace for some services; envied is a command-line tool for all services offered.
+
 
 **Installation for Linux** with a bare machine.
 
@@ -139,7 +141,9 @@ Finally, cd to TwinVine and run each command in order,
 ```
 
   
-That's it; uv run vinefeeder to get started!  
+That's it for Linux; uv run vinefeeder OR uv run envied dl -? to get started!  
+Vinefeeder offers a graphical interace for some services; envied is a command-line tool for all services offered.
+
 
 **Locations**
 
