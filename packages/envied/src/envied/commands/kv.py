@@ -4,8 +4,12 @@ from pathlib import Path
 from typing import Optional
 
 import click
+from rich.padding import Padding
+from rich.text import Text
+from rich.tree import Tree
 
 from envied.core.config import config
+from envied.core.console import console
 from envied.core.constants import context_settings
 from envied.core.services import Services
 from envied.core.vault import Vault
@@ -77,7 +81,19 @@ def kv() -> None:
 @click.argument("to_vault_name", type=str)
 @click.argument("from_vault_names", nargs=-1, type=click.UNPROCESSED)
 @click.option("-s", "--service", type=str, default=None, help="Only copy data to and from a specific service.")
-def copy(to_vault_name: str, from_vault_names: list[str], service: Optional[str] = None) -> None:
+@click.option(
+    "-l",
+    "--local-only",
+    is_flag=True,
+    default=False,
+    help="Only copy data for services installed locally (skip vault tables for services not present in the configured services path).",
+)
+def copy(
+    to_vault_name: str,
+    from_vault_names: list[str],
+    service: Optional[str] = None,
+    local_only: bool = False,
+) -> None:
     """
     Copy data from multiple Key Vaults into a single Key Vault.
     Rows with matching KIDs are skipped unless there's no KEY set.
@@ -103,13 +119,28 @@ def copy(to_vault_name: str, from_vault_names: list[str], service: Optional[str]
     vault_names = ", ".join([v.name for v in from_vaults])
     log.info(f"Copying data from {vault_names} → {to_vault.name}")
 
+    if service and local_only:
+        raise click.UsageError("--service and --local-only are mutually exclusive.")
+
     if service:
         service = Services.get_tag(service)
         log.info(f"Filtering by service: {service}")
 
+    installed: Optional[set[str]] = None
+    if local_only:
+        installed = {t.upper() for t in Services.get_tags()}
+        log.info(f"Filtering by locally installed services ({len(installed)} found)")
+
     total_added = 0
     for from_vault in from_vaults:
-        services_to_copy = [service] if service else from_vault.get_services()
+        services_to_copy = [service] if service else list(from_vault.get_services())
+
+        if installed is not None:
+            before = len(services_to_copy)
+            services_to_copy = [s for s in services_to_copy if s and s.upper() in installed]
+            skipped = before - len(services_to_copy)
+            if skipped:
+                log.info(f"{from_vault.name}: skipping {skipped} service(s) not installed locally")
 
         for service_tag in services_to_copy:
             added = copy_service_data(to_vault, from_vault, service_tag, log)
@@ -124,8 +155,20 @@ def copy(to_vault_name: str, from_vault_names: list[str], service: Optional[str]
 @kv.command()
 @click.argument("vaults", nargs=-1, type=click.UNPROCESSED)
 @click.option("-s", "--service", type=str, default=None, help="Only sync data to and from a specific service.")
+@click.option(
+    "-l",
+    "--local-only",
+    is_flag=True,
+    default=False,
+    help="Only sync data for services installed locally (skip vault tables for services not present in the configured services path).",
+)
 @click.pass_context
-def sync(ctx: click.Context, vaults: list[str], service: Optional[str] = None) -> None:
+def sync(
+    ctx: click.Context,
+    vaults: list[str],
+    service: Optional[str] = None,
+    local_only: bool = False,
+) -> None:
     """
     Ensure multiple Key Vaults copies of all keys as each other.
     It's essentially just a bi-way copy between each vault.
@@ -135,9 +178,21 @@ def sync(ctx: click.Context, vaults: list[str], service: Optional[str] = None) -
     if not len(vaults) > 1:
         raise click.ClickException("You must provide more than one Vault to sync.")
 
-    ctx.invoke(copy, to_vault_name=vaults[0], from_vault_names=vaults[1:], service=service)
+    ctx.invoke(
+        copy,
+        to_vault_name=vaults[0],
+        from_vault_names=vaults[1:],
+        service=service,
+        local_only=local_only,
+    )
     for i in range(1, len(vaults)):
-        ctx.invoke(copy, to_vault_name=vaults[i], from_vault_names=[vaults[i - 1]], service=service)
+        ctx.invoke(
+            copy,
+            to_vault_name=vaults[i],
+            from_vault_names=[vaults[i - 1]],
+            service=service,
+            local_only=local_only,
+        )
 
 
 @kv.command()
@@ -186,6 +241,72 @@ def add(file: Path, service: str, vaults: list[str]) -> None:
         log.info(f"{vault}: {added_count} newly added, {existed_count} already existed (skipped)")
 
     log.info("Done!")
+
+
+@kv.command()
+@click.argument("kid", type=str)
+@click.option("-s", "--service", type=str, default=None, help="Limit search to a specific service tag.")
+@click.option(
+    "-v", "--vault", "vault_name", type=str, default=None, help="Limit search to a specific configured vault by name."
+)
+def search(kid: str, service: Optional[str], vault_name: Optional[str]) -> None:
+    """
+    Search configured Key Vault(s) for a KID and report any matching KEY.
+
+    KID must be 32 hex characters (no dashes). If --service is omitted, every
+    service table in each vault is scanned. If --vault is omitted, every
+    vault in the config is searched.
+    """
+    log = logging.getLogger("kv")
+
+    kid_norm = kid.replace("-", "").lower()
+    if not re.fullmatch(r"[0-9a-f]{32}", kid_norm):
+        raise click.ClickException(f"KID '{kid}' is not 32 hex characters.")
+
+    if vault_name:
+        vault_names = [vault_name]
+    else:
+        vault_names = [v["name"] for v in config.key_vaults]
+    if not vault_names:
+        raise click.ClickException("No Key Vaults are configured.")
+
+    vaults_ = load_vaults(vault_names)
+
+    service_tag = Services.get_tag(service) if service else None
+
+    hit: Optional[tuple[str, str, str]] = None
+    for vault in vaults_:
+        if service_tag:
+            services_to_check: list[str] = [service_tag]
+        else:
+            try:
+                services_to_check = list(vault.get_services())
+            except Exception as e:
+                log.debug(f"{vault}: get_services() failed ({e})")
+                services_to_check = []
+            if not services_to_check:
+                log.warning(f"{vault}: cannot search without a service (remote vault requires --service). Skipping.")
+                continue
+
+        for svc in services_to_check:
+            try:
+                key = vault.get_key(kid_norm, svc)
+            except Exception as e:
+                log.debug(f"{vault} [{svc}]: lookup error ({e})")
+                continue
+            if key and key.count("0") != len(key):
+                hit = (vault.name, svc, key)
+                break
+        if hit:
+            break
+
+    if hit:
+        vname, svc, key = hit
+        tree = Tree(Text.assemble((svc, "cyan"), (f"({vname})", "text"), overflow="fold"))
+        tree.add(f"[text2]{kid_norm}:{key}")
+        console.print(Padding(tree, (1, 5)))
+    else:
+        log.info(f"KID {kid_norm} not found in {len(vaults_)} vault(s).")
 
 
 @kv.command()

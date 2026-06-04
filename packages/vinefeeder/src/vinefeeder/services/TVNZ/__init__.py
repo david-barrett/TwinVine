@@ -3,7 +3,7 @@ from vinefeeder.base_loader import BaseLoader
 from vinefeeder.parsing_utils import split_options, list_prettify
 from rich.console import Console
 from beaupy import select_multiple
-
+import json
 console = Console()
 
 # TV Shows https://www.tvnz.co.nz/shows/boiling-point/episodes/s1-e1 or
@@ -120,7 +120,8 @@ class TvnzLoader(BaseLoader):
         The function will prepare the series data, matching the search term for display.
         """
         # returns json as type String
-        url = f"https://apis-public-prod.tech.tvnz.co.nz/api/v1/web/play/search?q={search_term}"
+        #url = f"https://apis-public-prod.tech.tvnz.co.nz/api/v1/web/play/search?q={search_term}"
+        url = f"https://search-cdn.cms-api.tvnz.co.nz/content/search?mode=detail&st=published&term={search_term}&pageNumber=1&pageSize=50&reg=nz&dt=web&client=tvnz-tvnz-web&pf=regular&allowpg=false"
         try:
             html = self.get_data(url)
             if "No Matches" in html:
@@ -131,23 +132,25 @@ class TvnzLoader(BaseLoader):
         except Exception:
             print(f"No valid data returned for {url}")
             return
-        # console.print_json(data=parsed_data)
-        """f = open('tvnz.json', 'w')
+        '''# console.print_json(data=parsed_data)
+        f = open('tvnz.json', 'w')
         f.write(json.dumps(parsed_data))  # parsed_data)
-        f.close()"""
-        if parsed_data and "results" in parsed_data:
-            for item in parsed_data["results"]:
-                series_name = item.get("title", "Unknown Series")
-                url = "https://apis-edge-prod.tech.tvnz.co.nz" + item.get(
-                    "page", {}
-                ).get("href", "")
+        f.close()'''
+  
+        if parsed_data and "Success" in parsed_data["header"]["message"]:
+            for item in parsed_data["data"]:
+                title = item.get("lon", [{"n": ""}])[0].get("n")
+                content_type = item.get("cty")
+                content_id = item.get("nu")
+                synopsis = item.get("losd", [{"n": ""}])[0].get("n")
+                url=f"https://tvnz.co.nz/{content_type}/{content_id}"
                 episode = {
-                    "type": item.get("type"),  # 'type'
-                    "title": item.get("title", "Unknown Title"),
+                    "type": content_type, 
+                    "title": title,
                     "url": url,
-                    "synopsis": item.get("synopsis", "No synopsis available."),
+                    "synopsis": synopsis,
                 }
-                self.add_episode(series_name, episode)
+                self.add_episode(title, episode)
         else:
             print(f"No valid data returned for {url}")
             return None
@@ -181,7 +184,7 @@ class TvnzLoader(BaseLoader):
             beaupylist = []
             # if sport video / news video - assume no episodes
             # use data from first fetch directly
-            if type == "sportVideo" or type == "newsVideo":
+            if type == "tvseries":
                 for item in episodes[selected]:  # existing data
                     url = "https://www.tvnz.co.nz/" + item.get("url").split("/page/")[1]
                     beaupylist.append(
@@ -210,7 +213,7 @@ class TvnzLoader(BaseLoader):
                     self.runsubprocess(command)
                 return None
 
-            elif type == "show" or type == "showVideo":
+            elif type == "movie" or type == "tvseries":
                 url = f"https://apis-public-prod.tech.tvnz.co.nz/api/v1/web/play/page/shows/{series_name}/episodes"
                 try:
                     html = self.get_data(url)
@@ -219,7 +222,7 @@ class TvnzLoader(BaseLoader):
                     try:
                         # direct download as seems only one episode
                         # https://www.tvnz.co.nz/shows/circle-of-friends/movie/s1-e1
-                        url = f"https://www.tvnz.co.nz/shows/{series_name}/movie/s1-e1"
+                        url = f"https://www.tvnz.co.nz/{type}/{series_name}/s1-e1"
                         if self.options_list[0] == "":
                             command = ['uv', 'run', 'envied', "dl", "TVNZ", url]
                         else:

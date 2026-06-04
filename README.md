@@ -173,7 +173,7 @@ These services have web-origins and not all have been tested by me.
 **Other README's""
     TwinVine/packages/vinefeeder/src/vinefeeder/README.md  
     for details for confuring Envied download options on a service by service basis.
-    TwinVine/packages/envied/README.md  links to wiki (unshackle - envied's parent)
+    TwinVine/packages/envied/README.md  links to wiki (envied - envied's parent)
 
 
 

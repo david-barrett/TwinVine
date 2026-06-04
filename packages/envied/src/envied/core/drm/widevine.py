@@ -27,6 +27,12 @@ from envied.core.utils.subprocess import ffprobe
 class Widevine:
     """Widevine DRM System."""
 
+    PLACEHOLDER_KIDS = {
+        UUID("00000000-0000-0000-0000-000000000000"),  # All zeros (key rotation default)
+        UUID("00010203-0405-0607-0809-0a0b0c0d0e0f"),  # Sequential 0x00-0x0f
+        UUID("00010203-0405-0607-0809-101112131415"),  # Shaka Packager test pattern
+    }
+
     def __init__(self, pssh: PSSH, kid: Union[UUID, str, bytes, None] = None, **kwargs: Any):
         if not pssh:
             raise ValueError("Provided PSSH is empty.")
@@ -36,6 +42,7 @@ class Widevine:
         if pssh.system_id == PSSH.SystemId.PlayReady:
             pssh.to_widevine()
 
+        self._kid: Optional[UUID] = None
         if kid:
             if isinstance(kid, str):
                 kid = UUID(hex=kid)
@@ -43,7 +50,11 @@ class Widevine:
                 kid = UUID(bytes=kid)
             if not isinstance(kid, UUID):
                 raise ValueError(f"Expected kid to be a {UUID}, str, or bytes, not {kid!r}")
-            pssh.set_key_ids([kid])
+            self._kid = kid
+            if pssh.key_ids and all(k in self.PLACEHOLDER_KIDS for k in pssh.key_ids):
+                pssh.set_key_ids([kid])
+            elif kid not in (pssh.key_ids or []):
+                pssh.set_key_ids([*(pssh.key_ids or []), kid])
 
         self._pssh = pssh
 
@@ -161,8 +172,24 @@ class Widevine:
 
     @property
     def kids(self) -> list[UUID]:
-        """Get all Key IDs."""
-        return self._pssh.key_ids
+        """Get all Key IDs from PSSH, falling back to the externally provided KID."""
+        pssh_kids = self._pssh.key_ids
+        if pssh_kids:
+            return pssh_kids
+        if self._kid:
+            return [self._kid]
+        return []
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise this DRM instance for export/import (PSSH + KIDs).
+
+        Content keys are stored once at the export's track level, not duplicated here.
+        """
+        return {
+            "system": "Widevine",
+            "pssh_b64": self.pssh.dumps(),
+            "kids": [kid.hex for kid in self.kids],
+        }
 
     def get_content_keys(self, cdm: WidevineCdm, certificate: Callable, licence: Callable) -> None:
         """
@@ -189,7 +216,11 @@ class Widevine:
                 if hasattr(cdm, "has_cached_keys") and cdm.has_cached_keys(session_id):
                     pass
                 else:
-                    cdm.parse_license(session_id, licence(challenge=challenge))
+                    try:
+                        license_res = licence(challenge=challenge, pssh=self.pssh)
+                    except TypeError:
+                        license_res = licence(challenge=challenge)
+                    cdm.parse_license(session_id, license_res)
 
                 self.content_keys = {key.kid: key.key.hex() for key in cdm.get_keys(session_id, "CONTENT")}
                 if not self.content_keys:
@@ -276,6 +307,15 @@ class Widevine:
             key_hex = key if isinstance(key, str) else key.hex()
             key_args.extend(["--key", f"{kid_hex}:{key_hex}"])
 
+        # Fallback for tracks whose tenc default_KID is all-zero and whose real
+        # KID is signalled out-of-band: emit a zero-KID entry per content key.
+        zero_kid = "00" * 16
+        existing_kids = {kid.hex if hasattr(kid, "hex") else str(kid).replace("-", "") for kid in self.content_keys}
+        if zero_kid not in existing_kids:
+            for key in self.content_keys.values():
+                key_hex = key if isinstance(key, str) else key.hex()
+                key_args.extend(["--key", f"{zero_kid}:{key_hex}"])
+
         cmd = [
             str(binaries.Mp4decrypt),
             "--show-progress",
@@ -285,7 +325,7 @@ class Widevine:
         ]
 
         try:
-            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
         except subprocess.CalledProcessError as e:
             error_msg = e.stderr if e.stderr else f"mp4decrypt failed with exit code {e.returncode}"
             raise subprocess.CalledProcessError(e.returncode, cmd, output=e.stdout, stderr=error_msg)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 import logging
 import math
 import os
@@ -22,29 +23,22 @@ from typing import Any, Callable, Optional
 from uuid import UUID
 
 import click
-import jsonpickle
 import yaml
-from construct import ConstError
 from langcodes import Language
 from pymediainfo import MediaInfo
-from pyplayready.cdm import Cdm as PlayReadyCdm
-from pyplayready.device import Device as PlayReadyDevice
-from pyplayready.remote.remotecdm import RemoteCdm as PlayReadyRemoteCdm
-from pywidevine.cdm import Cdm as WidevineCdm
-from pywidevine.device import Device
-from pywidevine.remotecdm import RemoteCdm
 from rich.console import Group
 from rich.live import Live
 from rich.padding import Padding
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskID, TextColumn, TimeRemainingColumn
 from rich.rule import Rule
+from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
 
 from envied.core import binaries, providers
-from envied.core.cdm import CustomRemoteCDM, DecryptLabsRemoteCDM
+from envied.core.cdm import DecryptLabsRemoteCDM
 from envied.core.cdm.detect import is_playready_cdm, is_widevine_cdm
 from envied.core.config import config
 from envied.core.console import console
@@ -60,12 +54,15 @@ from envied.core.titles import Movie, Movies, Series, Song, Title_T
 from envied.core.titles.episode import Episode
 from envied.core.tracks import Audio, Subtitle, Tracks, Video
 from envied.core.tracks.attachment import Attachment
+from envied.core.tracks.dv_fixup import apply_dv_fixup
 from envied.core.tracks.hybrid import Hybrid
-from envied.core.utilities import (find_font_with_fallbacks, get_debug_logger, get_system_fonts, init_debug_logger,
-                                      is_close_match, is_exact_match, suggest_font_packages, time_elapsed_since)
+from envied.core.utilities import (find_font_with_fallbacks, find_missing_langs, get_debug_logger,
+                                      get_system_fonts, init_debug_logger, is_close_match, suggest_font_packages,
+                                      time_elapsed_since)
 from envied.core.utils import tags
+from envied.core.utils.bitrate import apply_real_bitrates
 from envied.core.utils.click_types import (AUDIO_CODEC_LIST, LANGUAGE_RANGE, QUALITY_LIST, SEASON_RANGE,
-                                              ContextData, MultipleChoice, MultipleVideoCodecChoice,
+                                              SLOW_DELAY_RANGE, ContextData, MultipleChoice, MultipleVideoCodecChoice,
                                               SubtitleCodecChoice)
 from envied.core.utils.collections import merge_dict
 from envied.core.utils.selector import select_multiple
@@ -316,6 +313,20 @@ class dl:
         help="Audio Bitrate to download (in kbps), defaults to highest available.",
     )
     @click.option(
+        "-vb-range",
+        "--vbitrate-range",
+        type=str,
+        default=None,
+        help="Video Bitrate range in kbps (e.g., '6000-7000'). Selects the highest bitrate within the range.",
+    )
+    @click.option(
+        "-ab-range",
+        "--abitrate-range",
+        type=str,
+        default=None,
+        help="Audio Bitrate range in kbps (e.g., '128-256'). Selects the highest bitrate within the range.",
+    )
+    @click.option(
         "-r",
         "--range",
         "range_",
@@ -349,21 +360,21 @@ class dl:
         "--select-titles",
         is_flag=True,
         default=False,
-        help="Interactively select downloads from a list. Only use with Series to select Episodes",
+        help="Interactively select downloads from a list. Only use with Series to select Episodes.",
     )
     @click.option(
         "-w",
         "--wanted",
         type=SEASON_RANGE,
         default=None,
-        help="Wanted episodes, e.g. `S01-S05,S07`, `S01E01-S02E03`, `S02-S02E03`, e.t.c, defaults to all.",
+        help="Wanted episodes, e.g. `S01-S05,S07`, `S01E01-S02E03`, `S02-S02E03`, etc., defaults to all.",
     )
     @click.option(
         "-l",
         "--lang",
         type=LANGUAGE_RANGE,
         default="orig",
-        help="Language wanted for Video and Audio. Use 'orig' to select the original language, e.g. 'orig,en' for both original and English.",
+        help="Language(s) wanted for Video and Audio (comma-separated). Use 'orig' to select the original language, e.g. 'orig,en' for both original and English.",
     )
     @click.option(
         "--latest-episode",
@@ -376,7 +387,7 @@ class dl:
         "--v-lang",
         type=LANGUAGE_RANGE,
         default=[],
-        help="Language wanted for Video, you would use this if the video language doesn't match the audio.",
+        help="Language wanted for Video. You would use this if the video language doesn't match the audio.",
     )
     @click.option(
         "-al",
@@ -403,12 +414,28 @@ class dl:
         "--proxy",
         type=str,
         default=None,
-        help="Proxy URI to use. If a 2-letter country is provided, it will try get a proxy from the config.",
+        help="Proxy URI to use. If a 2-letter country is provided, it will try to get a proxy from the config.",
     )
     @click.option(
         "--tag", type=str, default=None, help="Set the Group Tag to be used, overriding the one in config if any."
     )
     @click.option("--repack", is_flag=True, default=False, help="Add REPACK tag to the output filename.")
+    @click.option(
+        "-rvb",
+        "--real-video-bitrate",
+        is_flag=True,
+        default=False,
+        help="Probe actual media size to compute true video bitrates (top renditions per codec/range), "
+        "overriding the manifest's declared bitrate.",
+    )
+    @click.option(
+        "-rab",
+        "--real-audio-bitrate",
+        is_flag=True,
+        default=False,
+        help="Probe actual media size to compute true audio bitrates (top renditions per codec/channels/language), "
+        "overriding the manifest's declared bitrate. Slower than --real-video-bitrate (more renditions).",
+    )
     @click.option(
         "--tmdb",
         "tmdb_id",
@@ -445,18 +472,19 @@ class dl:
     @click.option("-V", "--video-only", is_flag=True, default=False, help="Only download video tracks.")
     @click.option("-A", "--audio-only", is_flag=True, default=False, help="Only download audio tracks.")
     @click.option("-S", "--subs-only", is_flag=True, default=False, help="Only download subtitle tracks.")
-    @click.option("-C", "--chapters-only", is_flag=True, default=False, help="Only download chapters.")
+    @click.option("-C", "--chapters-only", is_flag=True, default=False, help="Only download chapter markers.")
     @click.option("-ns", "--no-subs", is_flag=True, default=False, help="Do not download subtitle tracks.")
     @click.option("-na", "--no-audio", is_flag=True, default=False, help="Do not download audio tracks.")
-    @click.option("-nc", "--no-chapters", is_flag=True, default=False, help="Do not download chapters tracks.")
+    @click.option("-nc", "--no-chapters", is_flag=True, default=False, help="Do not download chapter markers.")
     @click.option("-nv", "--no-video", is_flag=True, default=False, help="Do not download video tracks.")
     @click.option("-ad", "--audio-description", is_flag=True, default=False, help="Download audio description tracks.")
     @click.option(
         "--slow",
-        is_flag=True,
-        default=False,
-        help="Add a 60-120 second delay between each Title download to act more like a real device. "
-        "This is recommended if you are downloading high-risk titles or streams.",
+        type=SLOW_DELAY_RANGE,
+        default=None,
+        help="Add a delay between each Title download to act more like a real device. "
+        "Use --slow for a 60-120s delay, or --slow MIN-MAX (e.g., --slow 20-40) for a custom range. "
+        "Minimum delay is 20 seconds.",
     )
     @click.option(
         "--list",
@@ -474,7 +502,20 @@ class dl:
     @click.option(
         "--skip-dl", is_flag=True, default=False, help="Skip downloading while still retrieving the decryption keys."
     )
-    @click.option("--export", type=Path, help="Export Decryption Keys as you obtain them to a JSON file.")
+    @click.option(
+        "--export",
+        is_flag=True,
+        default=False,
+        help="Export track info and decryption keys to a JSON file in the exports directory.",
+    )
+    @click.option(
+        "--import",
+        "import_file",
+        type=str,
+        default=None,
+        hidden=True,
+        help="Internal: path to an export JSON to reconstruct a download from (used by 'unshackle import').",
+    )
     @click.option(
         "--cdm-only/--vaults-only",
         is_flag=True,
@@ -482,6 +523,12 @@ class dl:
         help="Only use CDM, or only use Key Vaults for retrieval of Decryption Keys.",
     )
     @click.option("--no-proxy", is_flag=True, default=False, help="Force disable all proxy use.")
+    @click.option(
+        "--no-proxy-download",
+        is_flag=True,
+        default=False,
+        help="Bypass proxy for segment downloads only. Manifest, license, and auth still use proxy.",
+    )
     @click.option("--no-folder", is_flag=True, default=False, help="Disable folder creation for TV Shows.")
     @click.option(
         "--no-source", is_flag=True, default=False, help="Disable the source tag from the output file name and path."
@@ -519,11 +566,27 @@ class dl:
         default=False,
         help="Continue with best available quality if requested resolutions are not available.",
     )
+    @click.option(
+        "--remote",
+        is_flag=True,
+        default=False,
+        is_eager=True,
+        help="Use a remote unshackle server instead of local service code.",
+    )
+    @click.option(
+        "--server",
+        type=str,
+        default=None,
+        is_eager=True,
+        help="Name of the remote server from remote_services config (if multiple configured).",
+    )
     @click.pass_context
     def cli(ctx: click.Context, **kwargs: Any) -> dl:
         return dl(ctx, **kwargs)
 
     DRM_TABLE_LOCK = Lock()
+    EXPORT_LOCK = Lock()
+    LICENSE_KEY_CACHE: dict[UUID, str] = {}
 
     def __init__(
         self,
@@ -545,6 +608,14 @@ class dl:
             raise ValueError("A subcommand to invoke was not specified, the main code cannot continue.")
 
         self.log = logging.getLogger("download")
+        self.completed_files: list[Path] = []
+
+        if not config.output_template:
+            raise click.ClickException(
+                "No 'output_template' configured in your envied.yaml.\n"
+                "Please add an 'output_template' section with movies, series, and songs templates.\n"
+                "See unshackle-example.yaml for examples."
+            )
 
         self.service = Services.get_tag(ctx.invoked_subcommand)
         service_dl_config = config.services.get(self.service, {}).get("dl", {})
@@ -580,6 +651,7 @@ class dl:
                         )
 
         self.profile = profile
+        self.proxy_requested = bool(proxy)
         self.tmdb_id = tmdb_id
         self.imdb_id = imdb_id
         self.enrich = enrich
@@ -646,7 +718,6 @@ class dl:
                 for name, binary in [
                     ("shaka_packager", binaries.ShakaPackager),
                     ("mp4decrypt", binaries.Mp4decrypt),
-                    ("n_m3u8dl_re", binaries.N_m3u8DL_RE),
                     ("mkvmerge", binaries.MKVToolNix),
                     ("ffmpeg", binaries.FFMPEG),
                     ("ffprobe", binaries.FFProbe),
@@ -672,11 +743,6 @@ class dl:
                                 output = (r.stdout or "") + (r.stderr or "")
                                 lines = [line.strip() for line in output.split("\n") if line.strip()]
                                 version = " | ".join(lines[:2]) if lines else None
-                            elif name == "n_m3u8dl_re":
-                                r = subprocess.run(
-                                    [str(binary), "--version"], capture_output=True, text=True, timeout=5
-                                )
-                                version = (r.stdout or r.stderr or "").strip().split("\n")[0]
                         except Exception:
                             version = "<error getting version>"
                         binary_versions[name] = {"path": str(binary), "version": version}
@@ -695,24 +761,26 @@ class dl:
         if self.profile:
             self.log.info(f"Using profile: '{self.profile}'")
 
-        with console.status("Loading Service Config...", spinner="dots"):
-            service_config_path = Services.get_path(self.service) / config.filenames.config
-            if service_config_path.exists():
-                self.service_config = yaml.safe_load(service_config_path.read_text(encoding="utf8"))
-                self.log.info("Service Config loaded")
-                if self.debug_logger:
-                    self.debug_logger.log(
-                        level="DEBUG",
-                        operation="load_service_config",
-                        service=self.service,
-                        context={"config_path": str(service_config_path), "config": self.service_config},
-                    )
-            else:
-                self.service_config = {}
-            merge_dict(config.services.get(self.service), self.service_config)
+        self.is_remote = bool(ctx.params.get("remote"))
 
-        if getattr(config, "downloader_map", None):
-            config.downloader = config.downloader_map.get(self.service, config.downloader)
+        with console.status("Loading Service Config...", spinner="dots"):
+            self.service_config = {}
+            if not self.is_remote:
+                try:
+                    service_config_path = Services.get_path(self.service) / config.filenames.config
+                    if service_config_path.exists():
+                        self.service_config = yaml.safe_load(service_config_path.read_text(encoding="utf8"))
+                        self.log.info("Service Config loaded")
+                        if self.debug_logger:
+                            self.debug_logger.log(
+                                level="DEBUG",
+                                operation="load_service_config",
+                                service=self.service,
+                                context={"config_path": str(service_config_path), "config": self.service_config},
+                            )
+                except KeyError:
+                    pass
+            merge_dict(config.services.get(self.service), self.service_config)
 
         if getattr(config, "decryption_map", None):
             config.decryption = config.decryption_map.get(self.service, config.decryption)
@@ -962,6 +1030,8 @@ class dl:
         acodec: list[Audio.Codec],
         vbitrate: int,
         abitrate: int,
+        vbitrate_range: Optional[str],
+        abitrate_range: Optional[str],
         range_: list[Video.Range],
         channels: float,
         no_atmos: bool,
@@ -985,13 +1055,14 @@ class dl:
         no_chapters: bool,
         no_video: bool,
         audio_description: bool,
-        slow: bool,
+        slow: Optional[tuple[int, int]],
         list_: bool,
         list_titles: bool,
         skip_dl: bool,
-        export: Optional[Path],
+        export: bool,
         cdm_only: Optional[bool],
         no_proxy: bool,
+        no_proxy_download: bool,
         no_folder: bool,
         no_source: bool,
         no_mux: bool,
@@ -1000,15 +1071,59 @@ class dl:
         worst: bool,
         best_available: bool,
         split_audio: Optional[bool] = None,
+        real_video_bitrate: bool = False,
+        real_audio_bitrate: bool = False,
         *_: Any,
         **__: Any,
     ) -> None:
         self.tmdb_searched = False
         self.search_source = None
+        self.server_cdm = getattr(service, "_server_cdm", False)
+        self._remote_service = service if self.server_cdm else None
         start_time = time.time()
 
         if skip_dl:
             DOWNLOAD_LICENCE_ONLY.set()
+
+        if export:
+            config.directories.exports.mkdir(parents=True, exist_ok=True)
+            export_path = config.directories.exports / f"export_{self.service}_{int(time.time())}.json"
+            self.export_service = service
+        else:
+            export_path = None
+
+        # Parse bitrate range options
+        vbitrate_min, vbitrate_max = None, None
+        if vbitrate_range:
+            if vbitrate and vbitrate_range:
+                self.log.error("Cannot use both --vbitrate and --vbitrate-range at the same time.")
+                sys.exit(1)
+            try:
+                parts = vbitrate_range.split("-")
+                if len(parts) != 2:
+                    raise ValueError
+                vbitrate_min, vbitrate_max = int(parts[0]), int(parts[1])
+                if vbitrate_min > vbitrate_max:
+                    vbitrate_min, vbitrate_max = vbitrate_max, vbitrate_min
+            except (ValueError, IndexError):
+                self.log.error("Invalid --vbitrate-range format. Use 'MIN-MAX' (e.g., '6000-7000').")
+                sys.exit(1)
+
+        abitrate_min, abitrate_max = None, None
+        if abitrate_range:
+            if abitrate and abitrate_range:
+                self.log.error("Cannot use both --abitrate and --abitrate-range at the same time.")
+                sys.exit(1)
+            try:
+                parts = abitrate_range.split("-")
+                if len(parts) != 2:
+                    raise ValueError
+                abitrate_min, abitrate_max = int(parts[0]), int(parts[1])
+                if abitrate_min > abitrate_max:
+                    abitrate_min, abitrate_max = abitrate_max, abitrate_min
+            except (ValueError, IndexError):
+                self.log.error("Invalid --abitrate-range format. Use 'MIN-MAX' (e.g., '128-256').")
+                sys.exit(1)
 
         if not acodec:
             acodec = []
@@ -1057,7 +1172,10 @@ class dl:
                 },
             )
 
-        with console.status("Authenticating with Service...", spinner="dots"):
+        with console.status(
+            "Authenticating with Remote Service..." if self.is_remote else "Authenticating with Service...",
+            spinner="dots",
+        ):
             try:
                 cookies = self.get_cookie_jar(self.service, self.profile)
                 credential = self.get_credentials(self.service, self.profile)
@@ -1082,7 +1200,9 @@ class dl:
                     )
                 raise
 
-        with console.status("Fetching Title Metadata...", spinner="dots"):
+        with console.status(
+            "Fetching Remote Title Metadata..." if self.is_remote else "Fetching Title Metadata...", spinner="dots"
+        ):
             try:
                 titles = service.get_titles_cached()
                 if not titles:
@@ -1326,9 +1446,12 @@ class dl:
                 )
 
             if slow and i != 0:
-                delay = random.randint(60, 120)
-                with console.status(f"Delaying by {delay} seconds..."):
-                    time.sleep(delay)
+                delay = random.randint(slow[0], slow[1])
+                spinner = Spinner("dots", text=f"Delaying by {delay} seconds...")
+                with Live(Padding(spinner, (0, 5)), console=console, refresh_per_second=12.5, transient=True):
+                    for remaining in range(delay, 0, -1):
+                        spinner.update(text=f"Delaying by {remaining} seconds...")
+                        time.sleep(1)
 
             with console.status("Subscribing to events...", spinner="dots"):
                 events.reset()
@@ -1362,7 +1485,11 @@ class dl:
                 console.log("Skipped chapters as --no-chapters was used...")
                 title.tracks.chapters = []
 
-            with console.status("Getting tracks...", spinner="dots"):
+            if no_proxy_download and any(service.session.proxies.values()):
+                console.log("Bypassing proxy for downloads as --no-proxy-download was used...")
+
+            tracks_label = "Getting Remote Tracks..." if self.is_remote else "Getting Tracks..."
+            with console.status(tracks_label, spinner="dots"):
                 try:
                     title.tracks.add(service.get_tracks(title), warn_only=True)
                     title.tracks.chapters = service.get_chapters(title)
@@ -1432,10 +1559,28 @@ class dl:
                         title.tracks.add(non_sdh_sub)
                         events.subscribe(
                             events.Types.TRACK_MULTIPLEX,
-                            lambda track, sub_id=non_sdh_sub.id: (track.strip_hearing_impaired())
-                            if track.id == sub_id
-                            else None,
+                            lambda track, sub_id=non_sdh_sub.id: (
+                                (track.strip_hearing_impaired()) if track.id == sub_id else None
+                            ),
                         )
+
+            if real_video_bitrate:
+                with console.status("Probing real video bitrates...", spinner="dots"):
+                    apply_real_bitrates(
+                        title.tracks.videos,
+                        service.session,
+                        log=self.log,
+                        group_key=lambda t: (t.codec, t.range),
+                    )
+
+            if real_audio_bitrate:
+                with console.status("Probing real audio bitrates...", spinner="dots"):
+                    apply_real_bitrates(
+                        title.tracks.audio,
+                        service.session,
+                        log=self.log,
+                        group_key=lambda t: (t.codec, t.channels, str(t.language), t.descriptive),
+                    )
 
             with console.status("Sorting tracks by language and bitrate...", spinner="dots"):
                 video_sort_lang = v_lang or lang
@@ -1463,7 +1608,10 @@ class dl:
                             processed_audio_sort_lang.append(language)
 
                 title.tracks.sort_videos(by_language=processed_video_sort_lang)
-                title.tracks.sort_audio(by_language=processed_audio_sort_lang)
+                title.tracks.sort_audio(
+                    by_language=processed_audio_sort_lang,
+                    codec_priority=config.audio.get("codec_priority"),
+                )
                 title.tracks.sort_subtitles(by_language=s_lang)
 
             if list_:
@@ -1490,6 +1638,9 @@ class dl:
                             missing_ranges = [r for r in range_ if not any(x.range == r for x in title.tracks.videos)]
                             for color_range in missing_ranges:
                                 self.log.warning(f"Skipping {color_range.name} video tracks as none are available.")
+                            if not title.tracks.videos:
+                                self.log.error(f"There's no {', '.join(r.name for r in range_)} Video Track...")
+                                sys.exit(1)
 
                     if vbitrate:
                         if any(r == Video.Range.HYBRID for r in range_):
@@ -1507,7 +1658,19 @@ class dl:
                                 self.log.error(f"There's no {vbitrate}kbps Video Track...")
                                 sys.exit(1)
 
-                    video_languages = [lang for lang in (v_lang or lang) if lang != "best"]
+                    if vbitrate_min is not None and vbitrate_max is not None:
+                        title.tracks.select_video(
+                            lambda x: x.bitrate and vbitrate_min <= x.bitrate // 1000 <= vbitrate_max
+                        )
+                        if not title.tracks.videos:
+                            self.log.error(f"No Video Track in {vbitrate_min}-{vbitrate_max}kbps range...")
+                            sys.exit(1)
+
+                    effective_video_lang = v_lang or lang
+                    video_languages = [lang for lang in effective_video_lang if lang != "best"]
+                    video_multi_lang = (
+                        "best" in effective_video_lang or "all" in effective_video_lang or len(video_languages) > 1
+                    )
                     if video_languages and "all" not in video_languages:
                         processed_video_lang = []
                         for language in video_languages:
@@ -1534,11 +1697,13 @@ class dl:
 
                     has_hybrid = any(r == Video.Range.HYBRID for r in range_)
                     non_hybrid_ranges = [r for r in range_ if r != Video.Range.HYBRID]
+                    # DV is both a hybrid ingredient (lowest track) and, when explicitly
+                    # requested, a standalone deliverable (best track per resolution).
+                    dv_is_deliverable = Video.Range.DV in non_hybrid_ranges
 
                     if quality:
                         missing_resolutions = []
                         if has_hybrid:
-                            # Split tracks: hybrid candidates vs non-hybrid
                             hybrid_candidate_tracks = [
                                 v
                                 for v in title.tracks.videos
@@ -1548,20 +1713,19 @@ class dl:
                                 v
                                 for v in title.tracks.videos
                                 if v.range not in (Video.Range.HDR10, Video.Range.HDR10P, Video.Range.DV)
+                                or (dv_is_deliverable and v.range == Video.Range.DV)
                             ]
 
-                            # Apply hybrid selection to HDR10+DV tracks
-                            hybrid_filter = title.tracks.select_hybrid(hybrid_candidate_tracks, quality)
+                            hybrid_filter = title.tracks.select_hybrid(hybrid_candidate_tracks, quality, worst=worst)
                             hybrid_selected = list(filter(hybrid_filter, hybrid_candidate_tracks))
 
                             if non_hybrid_ranges and non_hybrid_tracks:
-                                # Also filter non-hybrid tracks by resolution
                                 non_hybrid_selected = [
                                     v
                                     for v in non_hybrid_tracks
                                     if any(v.height == res or int(v.width * (9 / 16)) == res for res in quality)
                                 ]
-                                title.tracks.videos = hybrid_selected + non_hybrid_selected
+                                title.tracks.videos = Tracks.merge_video_selections(hybrid_selected, non_hybrid_selected)
                             else:
                                 title.tracks.videos = hybrid_selected
                         else:
@@ -1590,6 +1754,7 @@ class dl:
                                 sys.exit(1)
 
                     # choose best track by range and quality
+                    pre_hybrid_videos: list[Video] = list(title.tracks.videos) if has_hybrid else []
                     if has_hybrid:
                         # Apply hybrid selection for HYBRID tracks
                         hybrid_candidate_tracks = [
@@ -1601,24 +1766,32 @@ class dl:
                             v
                             for v in title.tracks.videos
                             if v.range not in (Video.Range.HDR10, Video.Range.HDR10P, Video.Range.DV)
+                            or (dv_is_deliverable and v.range == Video.Range.DV)
                         ]
 
                         if not quality:
                             best_resolution = max((v.height for v in hybrid_candidate_tracks), default=None)
                             if best_resolution:
-                                hybrid_filter = title.tracks.select_hybrid(hybrid_candidate_tracks, [best_resolution])
+                                hybrid_filter = title.tracks.select_hybrid(
+                                    hybrid_candidate_tracks, [best_resolution], worst=worst
+                                )
                                 hybrid_selected = list(filter(hybrid_filter, hybrid_candidate_tracks))
                             else:
                                 hybrid_selected = []
                         else:
-                            hybrid_filter = title.tracks.select_hybrid(hybrid_candidate_tracks, quality)
+                            hybrid_filter = title.tracks.select_hybrid(hybrid_candidate_tracks, quality, worst=worst)
                             hybrid_selected = list(filter(hybrid_filter, hybrid_candidate_tracks))
 
                         # For non-hybrid ranges, apply Cartesian product selection
                         non_hybrid_selected: list[Video] = []
                         if non_hybrid_ranges and non_hybrid_tracks:
-                            for resolution, color_range, codec in product(
-                                quality or [None], non_hybrid_ranges, vcodec or [None]
+                            # Include language dimension when multiple video languages were requested
+                            if video_multi_lang:
+                                non_hybrid_langs = list(dict.fromkeys(str(v.language) for v in non_hybrid_tracks))
+                            else:
+                                non_hybrid_langs = [None]
+                            for resolution, color_range, codec, vlang in product(
+                                quality or [None], non_hybrid_ranges, vcodec or [None], non_hybrid_langs
                             ):
                                 candidates = [
                                     t
@@ -1630,27 +1803,38 @@ class dl:
                                     )
                                     and (not color_range or t.range == color_range)
                                     and (not codec or t.codec == codec)
+                                    and (vlang is None or str(t.language) == vlang)
                                 ]
                                 match = candidates[-1] if worst and candidates else next(iter(candidates), None)
                                 if match and match not in non_hybrid_selected:
                                     non_hybrid_selected.append(match)
 
-                        title.tracks.videos = hybrid_selected + non_hybrid_selected
+                        title.tracks.videos = Tracks.merge_video_selections(hybrid_selected, non_hybrid_selected)
+
+                        # Flag the lowest DV track as ingredient-only so mux skips it standalone,
+                        # unless it is itself the chosen DV deliverable (single DV rendition).
+                        selected_dv = [v for v in title.tracks.videos if v.range == Video.Range.DV]
+                        if selected_dv:
+                            ingredient_dv = min(selected_dv, key=lambda v: v.height)
+                            deliverable_dv = [v for v in non_hybrid_selected if v.range == Video.Range.DV]
+                            if not (dv_is_deliverable and ingredient_dv in deliverable_dv):
+                                ingredient_dv.hybrid_base_only = True
                     else:
                         selected_videos: list[Video] = []
-                        for resolution, color_range, codec in product(
-                            quality or [None], range_ or [None], vcodec or [None]
+                        if video_multi_lang:
+                            unique_video_langs = list(dict.fromkeys(str(v.language) for v in title.tracks.videos))
+                        else:
+                            unique_video_langs = [None]
+                        for resolution, color_range, codec, vlang in product(
+                            quality or [None], range_ or [None], vcodec or [None], unique_video_langs
                         ):
                             candidates = [
                                 t
                                 for t in title.tracks.videos
-                                if (
-                                    not resolution
-                                    or t.height == resolution
-                                    or int(t.width * (9 / 16)) == resolution
-                                )
+                                if (not resolution or t.height == resolution or int(t.width * (9 / 16)) == resolution)
                                 and (not color_range or t.range == color_range)
                                 and (not codec or t.codec == codec)
+                                and (vlang is None or str(t.language) == vlang)
                             ]
                             match = candidates[-1] if worst and candidates else next(iter(candidates), None)
                             if match and match not in selected_videos:
@@ -1691,6 +1875,31 @@ class dl:
                                     f"Continuing with remaining range(s): {', '.join(r.name for r in other_ranges)}"
                                 )
                                 range_ = other_ranges
+                                fallback_pool = pre_hybrid_videos
+                                if video_multi_lang:
+                                    fallback_langs = list(dict.fromkeys(str(v.language) for v in fallback_pool))
+                                else:
+                                    fallback_langs = [None]
+                                fallback_selected: list[Video] = []
+                                for resolution, color_range, codec, vlang in product(
+                                    quality or [None], other_ranges, vcodec or [None], fallback_langs
+                                ):
+                                    candidates = [
+                                        t
+                                        for t in fallback_pool
+                                        if (
+                                            not resolution
+                                            or t.height == resolution
+                                            or int(t.width * (9 / 16)) == resolution
+                                        )
+                                        and (not color_range or t.range == color_range)
+                                        and (not codec or t.codec == codec)
+                                        and (vlang is None or str(t.language) == vlang)
+                                    ]
+                                    match = candidates[-1] if worst and candidates else next(iter(candidates), None)
+                                    if match and match not in fallback_selected:
+                                        fallback_selected.append(match)
+                                title.tracks.videos = fallback_selected
                             else:
                                 self.log.error(msg)
                                 self.log.error(msg_detail)
@@ -1712,21 +1921,38 @@ class dl:
                             f"Required languages found ({', '.join(require_subs)}), downloading all available subtitles"
                         )
                     elif s_lang and "all" not in s_lang:
+                        from envied.core.utilities import is_exact_match
+
                         match_func = is_exact_match if exact_lang else is_close_match
 
-                        missing_langs = [
-                            lang_
-                            for lang_ in s_lang
-                            if not any(match_func(lang_, [sub.language]) for sub in title.tracks.subtitles)
-                        ]
+                        missing_langs = find_missing_langs(
+                            s_lang,
+                            [sub.language for sub in title.tracks.subtitles],
+                            exact=exact_lang,
+                        )
                         if missing_langs:
-                            self.log.error(", ".join(missing_langs) + " not found in tracks")
-                            sys.exit(1)
+                            missing_str = ", ".join(missing_langs)
+                            if best_available:
+                                remaining = [tok for tok in s_lang if tok not in missing_langs]
+                                if remaining:
+                                    self.log.warning(
+                                        f"{missing_str} not found in subtitle tracks, continuing with: {', '.join(remaining)}"
+                                    )
+                                    s_lang = remaining
+                                else:
+                                    self.log.warning(
+                                        f"{missing_str} not found in subtitle tracks, continuing without subtitles"
+                                    )
+                                    title.tracks.subtitles = []
+                            else:
+                                self.log.error(missing_str + " not found in tracks")
+                                sys.exit(1)
 
-                        title.tracks.select_subtitles(lambda x: match_func(x.language, s_lang))
-                        if not title.tracks.subtitles:
-                            self.log.error(f"There's no {s_lang} Subtitle Track...")
-                            sys.exit(1)
+                        if s_lang and title.tracks.subtitles:
+                            title.tracks.select_subtitles(lambda x: match_func(x.language, s_lang))
+                            if not title.tracks.subtitles and not best_available:
+                                self.log.error(f"There's no {s_lang} Subtitle Track...")
+                                sys.exit(1)
 
                     if not forced_subs:
                         title.tracks.select_subtitles(lambda x: not x.forced)
@@ -1757,6 +1983,13 @@ class dl:
                         if not title.tracks.audio:
                             self.log.error(f"There's no {abitrate}kbps Audio Track...")
                             sys.exit(1)
+                    if abitrate_min is not None and abitrate_max is not None:
+                        title.tracks.select_audio(
+                            lambda x: x.bitrate and abitrate_min <= x.bitrate // 1000 <= abitrate_max
+                        )
+                        if not title.tracks.audio:
+                            self.log.error(f"No Audio Track in {abitrate_min}-{abitrate_max}kbps range...")
+                            sys.exit(1)
                     audio_languages = a_lang or lang
                     if audio_languages:
                         processed_lang = []
@@ -1776,9 +2009,34 @@ class dl:
                                 if language not in processed_lang:
                                     processed_lang.append(language)
 
+                        if not any(tok in processed_lang for tok in ("best", "all")):
+                            missing_a_langs = find_missing_langs(
+                                processed_lang,
+                                [a.language for a in title.tracks.audio],
+                                exact=exact_lang,
+                            )
+                            if missing_a_langs:
+                                missing_str = ", ".join(missing_a_langs)
+                                if best_available:
+                                    remaining = [tok for tok in processed_lang if tok not in missing_a_langs]
+                                    if remaining:
+                                        self.log.warning(
+                                            f"{missing_str} not found in audio tracks, continuing with: {', '.join(remaining)}"
+                                        )
+                                        processed_lang = remaining
+                                    else:
+                                        self.log.error(
+                                            f"{missing_str} not found in audio tracks and no fallback available"
+                                        )
+                                        sys.exit(1)
+                                else:
+                                    self.log.error(missing_str + " not found in audio tracks")
+                                    sys.exit(1)
+
                         if "best" in processed_lang or "all" in processed_lang:
                             unique_languages = {track.language for track in title.tracks.audio}
                             selected_audio = []
+                            best_key = lambda x: (bool(x.atmos), x.bitrate or 0)  # noqa: E731
                             for language in unique_languages:
                                 codecs_to_check = acodec if (acodec and len(acodec) > 1) else [None]
                                 for codec in codecs_to_check:
@@ -1792,18 +2050,19 @@ class dl:
                                     if audio_description:
                                         standards = [t for t in base_candidates if not t.descriptive]
                                         if standards:
-                                            selected_audio.append(max(standards, key=lambda x: x.bitrate or 0))
+                                            selected_audio.append(max(standards, key=best_key))
                                         descs = [t for t in base_candidates if t.descriptive]
                                         if descs:
-                                            selected_audio.append(max(descs, key=lambda x: x.bitrate or 0))
+                                            selected_audio.append(max(descs, key=best_key))
                                     else:
-                                        selected_audio.append(max(base_candidates, key=lambda x: x.bitrate or 0))
+                                        selected_audio.append(max(base_candidates, key=best_key))
                             title.tracks.audio = selected_audio
                         else:
                             # If multiple codecs were explicitly requested, pick the best track per codec per
                             # requested language instead of selecting *all* bitrate variants of a codec.
                             if acodec and len(acodec) > 1:
                                 selected_audio: list[Audio] = []
+                                best_key = lambda x: (bool(x.atmos), x.bitrate or 0)  # noqa: E731
 
                                 for language in processed_lang:
                                     for codec in acodec:
@@ -1820,12 +2079,12 @@ class dl:
                                         if audio_description:
                                             standards = [t for t in candidates if not t.descriptive]
                                             if standards:
-                                                selected_audio.append(max(standards, key=lambda x: x.bitrate or 0))
+                                                selected_audio.append(max(standards, key=best_key))
                                             descs = [t for t in candidates if t.descriptive]
                                             if descs:
-                                                selected_audio.append(max(descs, key=lambda x: x.bitrate or 0))
+                                                selected_audio.append(max(descs, key=best_key))
                                         else:
-                                            selected_audio.append(max(candidates, key=lambda x: x.bitrate or 0))
+                                            selected_audio.append(max(candidates, key=best_key))
 
                                 title.tracks.audio = selected_audio
                             else:
@@ -1905,7 +2164,7 @@ class dl:
                         kept_tracks.extend(title.tracks.chapters)
                     kept_tracks.extend(title.tracks.attachments)
 
-                    title.tracks = Tracks(kept_tracks)
+                    title.tracks = Tracks(kept_tracks, manifest_url=title.tracks.manifest_url)
 
             selected_tracks, tracks_progress_callables = title.tracks.tree(add_progress=True)
 
@@ -1939,6 +2198,9 @@ class dl:
                             )
                             self.cdm = quality_based_cdm
 
+            if hasattr(service, "resolve_server_keys"):
+                service.resolve_server_keys(title)
+
             dl_start_time = time.time()
 
             try:
@@ -1948,7 +2210,8 @@ class dl:
                             (
                                 pool.submit(
                                     track.download,
-                                    session=service.session,
+                                    session=track.session or service.session,
+                                    no_proxy_download=no_proxy_download,
                                     prepare_drm=partial(
                                         partial(self.prepare_drm, table=download_table),
                                         track=track,
@@ -1967,7 +2230,7 @@ class dl:
                                         ),
                                         cdm_only=cdm_only,
                                         vaults_only=vaults_only,
-                                        export=export,
+                                        export=export_path,
                                     ),
                                     cdm=self.cdm,
                                     max_workers=workers,
@@ -1992,24 +2255,15 @@ class dl:
             except Exception as e:  # noqa
                 error_messages = [
                     ":x: Download Failed...",
+                    f"   {type(e).__name__}: {e}",
                 ]
-                if isinstance(e, EnvironmentError):
-                    error_messages.append(f"   {e}")
-                if isinstance(e, ValueError):
-                    error_messages.append(f"   {e}")
-                if isinstance(e, (AttributeError, TypeError)):
-                    console.print_exception()
-                else:
-                    error_messages.append(
-                        "   An unexpected error occurred in one of the download workers.",
-                    )
-                    if hasattr(e, "returncode"):
-                        error_messages.append(f"   Binary call failed, Process exit code: {e.returncode}")
-                    error_messages.append("   See the error trace above for more information.")
-                    if isinstance(e, subprocess.CalledProcessError):
-                        # CalledProcessError already lists the exception trace
-                        console.print_exception()
+                if hasattr(e, "returncode"):
+                    error_messages.append(f"   Binary call failed, Process exit code: {e.returncode}")
+                error_messages.append(
+                    "   An unexpected error occurred in one of the download workers.",
+                )
                 console.print(Padding(Group(*error_messages), (1, 5)))
+                console.print_exception()
 
                 if self.debug_logger:
                     self.debug_logger.log_error(
@@ -2103,7 +2357,6 @@ class dl:
                     and not video_only
                     and not no_video
                 ):
-                    match_func = is_exact_match if exact_lang else is_close_match
                     for video_track_n, video_track in enumerate(title.tracks.videos):
                         has_manifest_cc = bool(getattr(video_track, "closed_captions", None))
                         has_eia_cc = (
@@ -2117,48 +2370,27 @@ class dl:
                         if not has_manifest_cc and not has_eia_cc:
                             continue
 
-                        # Build list of CC entries to extract
-                        if has_manifest_cc:
-                            cc_entries = video_track.closed_captions
-                            # Filter CC languages against --s-lang if specified
-                            if s_lang and "all" not in s_lang:
-                                cc_entries = [
-                                    entry for entry in cc_entries
-                                    if entry.get("language")
-                                    and match_func(Language.get(entry["language"]), s_lang)
-                                ]
-                                if not cc_entries:
-                                    continue
-                        else:
-                            # EIA fallback: single entry with unknown language
-                            cc_entries = [{}]
-
                         with console.status(f"Checking Video track {video_track_n + 1} for Closed Captions..."):
                             try:
-                                for cc_idx, cc_entry in enumerate(cc_entries):
-                                    cc_lang = (
-                                        Language.get(cc_entry["language"])
-                                        if cc_entry.get("language")
-                                        else title.language or video_track.language
-                                    )
-                                    track_id = f"ccextractor-{video_track.id}-{cc_idx}"
-                                    cc = video_track.ccextractor(
-                                        track_id=track_id,
-                                        out_path=config.directories.temp
-                                        / config.filenames.subtitle.format(id=track_id, language=cc_lang),
-                                        language=cc_lang,
-                                        original=False,
-                                    )
-                                    if cc:
-                                        cc.cc = True
-                                        title.tracks.add(cc)
-                                        self.log.info(
-                                            f"Extracted a Closed Caption ({cc_lang}) from Video track {video_track_n + 1}"
-                                        )
-                                    else:
-                                        self.log.info(
-                                            f"No Closed Captions were found in Video track {video_track_n + 1}"
-                                        )
+                                cc_lang = (
+                                    Language.get(video_track.closed_captions[0]["language"])
+                                    if has_manifest_cc and video_track.closed_captions[0].get("language")
+                                    else title.language or video_track.language
+                                )
+                                track_id = f"ccextractor-{video_track.id}"
+                                cc = video_track.ccextractor(
+                                    track_id=track_id,
+                                    out_path=config.directories.temp
+                                    / config.filenames.subtitle.format(id=track_id, language=cc_lang),
+                                    language=cc_lang,
+                                    original=False,
+                                )
+                                if cc:
+                                    cc.cc = True
+                                    title.tracks.add(cc)
+                                    self.log.info(f"Extracted a Closed Caption from Video track {video_track_n + 1}")
+                                else:
+                                    self.log.info(f"No Closed Captions were found in Video track {video_track_n + 1}")
                             except EnvironmentError:
                                 self.log.error(
                                     "Cannot extract Closed Captions as the ccextractor executable was not found..."
@@ -2177,6 +2409,13 @@ class dl:
                         # we don't want to fill up the log with "Repacked x track"
                         self.log.info("Repacked one or more tracks with FFMPEG")
 
+                with console.status("Normalizing video VUI..."):
+                    for track in title.tracks.videos:
+                        try:
+                            track.normalize_vui()
+                        except Exception as e:  # noqa: BLE001
+                            self.log.warning(f"VUI normalization skipped for {track.id}: {e}")
+
                 muxed_paths = []
                 muxed_audio_codecs: dict[Path, Optional[Audio.Codec]] = {}
                 append_audio_codec_suffix = True
@@ -2193,6 +2432,8 @@ class dl:
                         BarColumn(),
                         "•",
                         TimeRemainingColumn(compact=True, elapsed_when_finished=True),
+                        "•",
+                        TextColumn("{task.fields[downloaded]}"),
                         console=console,
                     )
 
@@ -2218,7 +2459,9 @@ class dl:
 
                     def enqueue_mux_tasks(task_description: str, base_tracks: Tracks) -> None:
                         if merge_audio or not base_tracks.audio:
-                            task_id = progress.add_task(f"{task_description}...", total=None, start=False)
+                            task_id = progress.add_task(
+                                f"{task_description}...", total=None, start=False, downloaded=""
+                            )
                             multiplex_tasks.append((task_id, base_tracks, None))
                             return
 
@@ -2231,16 +2474,37 @@ class dl:
                             if audio_codec:
                                 description = f"{task_description} {audio_codec.name}"
 
-                            task_id = progress.add_task(f"{description}...", total=None, start=False)
+                            task_id = progress.add_task(f"{description}...", total=None, start=False, downloaded="")
                             task_tracks = clone_tracks_for_audio(base_tracks, codec_audio_tracks)
                             multiplex_tasks.append((task_id, task_tracks, audio_codec))
 
-                    # Check if we're in hybrid mode
+                    def mux_video_standalone(video_track: Optional[Video]) -> None:
+                        if video_track and video_track.dv_compatible_bitstream:
+                            apply_dv_fixup(video_track)
+
+                        task_description = "Multiplexing"
+                        if video_track:
+                            if len(quality) > 1:
+                                task_description += f" {video_track.height}p"
+                            if len(range_) > 1:
+                                task_description += f" {video_track.range.name}"
+                            if len(vcodec) > 1:
+                                task_description += f" {video_track.codec.name}"
+
+                        task_tracks = Tracks(title.tracks) + title.tracks.chapters + title.tracks.attachments
+                        if video_track:
+                            task_tracks.videos = [video_track]
+
+                        enqueue_mux_tasks(task_description, task_tracks)
+
                     if any(r == Video.Range.HYBRID for r in range_) and title.tracks.videos:
-                        # Hybrid mode: process DV and HDR10 tracks separately for each resolution
                         self.log.info("Processing Hybrid HDR10+DV tracks...")
 
-                        # Group video tracks by resolution (prefer HDR10+ over HDR10 as base)
+                        # Snapshot videos before hybrid tracks are added so the originals
+                        # can still be muxed standalone afterwards.
+                        original_videos = list(title.tracks.videos)
+
+                        # Prefer HDR10+ over HDR10 as the hybrid base layer.
                         resolutions_processed = set()
                         base_tracks_list = [
                             v for v in title.tracks.videos if v.range in (Video.Range.HDR10P, Video.Range.HDR10)
@@ -2251,38 +2515,33 @@ class dl:
                             resolution = hdr10_track.height
                             if resolution in resolutions_processed:
                                 continue
-                            resolutions_processed.add(resolution)
 
-                            # Find matching DV track for this resolution (use the lowest DV resolution)
+                            # DV layer only supplies RPU metadata, so the lowest resolution suffices.
                             matching_dv = min(dv_tracks, key=lambda v: v.height) if dv_tracks else None
 
                             if matching_dv:
-                                # Create track pair for this resolution
-                                resolution_tracks = [hdr10_track, matching_dv]
+                                resolutions_processed.add(resolution)
 
+                                # Operate on copies so the originals stay muxable standalone.
+                                resolution_tracks = [deepcopy(hdr10_track), deepcopy(matching_dv)]
                                 for track in resolution_tracks:
                                     track.needs_duration_fix = True
 
-                                # Run the hybrid processing for this resolution
                                 Hybrid(resolution_tracks, self.service)
 
-                                # Create unique output filename for this resolution
                                 hybrid_filename = f"HDR10-DV-{resolution}p.hevc"
                                 hybrid_output_path = config.directories.temp / hybrid_filename
                                 hybrid_temp_paths.append(hybrid_output_path)
 
-                                # The Hybrid class creates HDR10-DV.hevc, rename it for this resolution
+                                # Hybrid always writes HDR10-DV.hevc; rename it per resolution.
                                 default_output = config.directories.temp / "HDR10-DV.hevc"
                                 if default_output.exists():
-                                    # If a previous run left this behind, replace it to avoid move() failures.
                                     hybrid_output_path.unlink(missing_ok=True)
                                     shutil.move(str(default_output), str(hybrid_output_path))
 
-                                # Create tracks with the hybrid video output for this resolution
                                 task_description = f"Multiplexing Hybrid HDR10+DV {resolution}p"
                                 task_tracks = Tracks(title.tracks) + title.tracks.chapters + title.tracks.attachments
 
-                                # Create a new video track for the hybrid output
                                 hybrid_track = deepcopy(hdr10_track)
                                 hybrid_track.id = f"hybrid_{hdr10_track.id}_{resolution}"
                                 hybrid_track.path = hybrid_output_path
@@ -2293,24 +2552,17 @@ class dl:
 
                                 enqueue_mux_tasks(task_description, task_tracks)
 
+                        # Mux every requested range standalone, skipping the ingredient-only DV.
+                        for video_track in original_videos:
+                            if video_track.hybrid_base_only:
+                                continue
+                            mux_video_standalone(video_track)
+
                         console.print()
                     else:
                         # Normal mode: process each video track separately
                         for video_track in title.tracks.videos or [None]:
-                            task_description = "Multiplexing"
-                            if video_track:
-                                if len(quality) > 1:
-                                    task_description += f" {video_track.height}p"
-                                if len(range_) > 1:
-                                    task_description += f" {video_track.range.name}"
-                                if len(vcodec) > 1:
-                                    task_description += f" {video_track.codec.name}"
-
-                            task_tracks = Tracks(title.tracks) + title.tracks.chapters + title.tracks.attachments
-                            if video_track:
-                                task_tracks.videos = [video_track]
-
-                            enqueue_mux_tasks(task_description, task_tracks)
+                            mux_video_standalone(video_track)
 
                     try:
                         with Live(Padding(progress, (0, 5, 1, 5)), console=console):
@@ -2457,6 +2709,7 @@ class dl:
                             final_path = final_dir / f"{base_filename}{track_path.suffix}"
 
                         shutil.move(track_path, final_path)
+                        self.completed_files.append(final_path)
                         self.log.debug(f"Saved: {final_path.name}")
                 else:
                     # Handle muxed files
@@ -2494,6 +2747,7 @@ class dl:
                                 final_path.unlink()
                             shutil.move(muxed_path, final_path)
                         used_final_paths.add(final_path)
+                        self.completed_files.append(final_path)
                         tags.tag_file(final_path, title, self.tmdb_id, self.imdb_id)
 
                 title_dl_time = time_elapsed_since(dl_start_time)
@@ -2501,14 +2755,95 @@ class dl:
                     Padding(f":tada: Title downloaded in [progress.elapsed]{title_dl_time}[/]!", (0, 5, 1, 5))
                 )
 
-            # update cookies
-            cookie_file = self.get_cookie_path(self.service, self.profile)
-            if cookie_file:
-                self.save_cookies(cookie_file, service.session.cookies)
+            if not hasattr(service, "close"):
+                cookie_file = self.get_cookie_path(self.service, self.profile)
+                if cookie_file:
+                    self.save_cookies(cookie_file, service.session.cookies)
+
+        if hasattr(service, "close"):
+            service.close()
 
         dl_time = time_elapsed_since(start_time)
 
         console.print(Padding(f"Processed all titles in [progress.elapsed]{dl_time}", (0, 5, 1, 5)))
+
+    @staticmethod
+    def title_to_meta(title: Title_T) -> dict[str, Any]:
+        """Capture the title fields needed to rebuild a Title for output naming on import."""
+        from envied.core.titles import Episode, Movie
+
+        meta: dict[str, Any] = {
+            "id": str(title.id),
+            "language": str(title.language) if getattr(title, "language", None) else None,
+        }
+        if isinstance(title, Episode):
+            meta.update(
+                type="episode",
+                series_title=title.title,
+                season=title.season,
+                number=title.number,
+                name=title.name,
+                year=title.year,
+            )
+        elif isinstance(title, Movie):
+            meta.update(type="movie", name=title.name, year=title.year)
+        else:
+            meta.update(type="movie", name=str(title))
+        return meta
+
+    def write_export(self, export: Path, title: Title_T, track: AnyTrack, drm: Any) -> None:
+        """Write a shareable v2 export usable by ``unshackle import``.
+
+        Carries no session/cookies/dl-flags. Region (country code) is stored only when the
+        export used ``--proxy``, as an import geofence. Each track records only the licensed
+        DRM system; content keys live once under the track's ``keys``.
+        """
+        with self.EXPORT_LOCK:
+            doc: dict[str, Any] = {}
+            if export.is_file():
+                doc = json.loads(export.read_text(encoding="utf8")) or {}
+
+            doc.setdefault("version", 2)
+            doc.setdefault("service", self.service)
+            if "region" not in doc and getattr(self, "proxy_requested", False):
+                region = getattr(getattr(self, "export_service", None), "current_region", None)
+                if region:
+                    doc["region"] = region
+
+            titles = doc.setdefault("titles", {})
+            tinfo = titles.setdefault(str(title.id), {})
+            tinfo.setdefault("meta", self.title_to_meta(title))
+
+            if title.tracks.manifest_url:
+                tinfo.setdefault("manifest_url", title.tracks.manifest_url)
+
+            all_tracks = [*title.tracks.videos, *title.tracks.audio, *title.tracks.subtitles]
+            if "manifest_type" not in tinfo:
+                tinfo["manifest_type"] = next(
+                    (t.descriptor.name for t in all_tracks if t.descriptor != Video.Descriptor.URL), None
+                )
+
+            tracks_map = tinfo.setdefault("tracks", {})
+            if not tracks_map:
+                for t in all_tracks:
+                    tracks_map[str(t.id)] = t.to_dict()
+
+            track_data = tracks_map.setdefault(str(track.id), track.to_dict())
+            if hasattr(drm, "to_dict"):
+                track_data["drm"] = [drm.to_dict()]
+            keys = track_data.setdefault("keys", {})
+            for kid, key in drm.content_keys.items():
+                keys[kid.hex] = key
+
+            if "chapters" not in tinfo:
+                tinfo["chapters"] = [
+                    {"timestamp": chapter.timestamp, "name": chapter.name} for chapter in (title.tracks.chapters or [])
+                ]
+
+            if "attachments" not in tinfo:
+                tinfo["attachments"] = [a.to_dict() for a in (title.tracks.attachments or []) if a.url]
+
+            export.write_text(json.dumps(doc, indent=4, ensure_ascii=False), encoding="utf8")
 
     def prepare_drm(
         self,
@@ -2530,29 +2865,72 @@ class dl:
         if not drm:
             return
 
+        server_cdm = getattr(self, "server_cdm", False)
+
+        if server_cdm:
+            if not drm.content_keys:
+                self.log.warning("Server CDM did not resolve any keys for this track")
+                return
+            svc = getattr(self, "_remote_service", None)
+            server_drm_type = getattr(svc, "_server_cdm_type", None) if svc else None
+            drm_name = {"widevine": "Widevine", "playready": "PlayReady"}.get(
+                server_drm_type or "", drm.__class__.__name__
+            )
+            with self.DRM_TABLE_LOCK:
+                pssh_str = ""
+                expected_class = "PlayReady" if server_drm_type == "playready" else "Widevine"
+                matching_drm = next(
+                    (d for d in (track.drm or []) if d.__class__.__name__ == expected_class),
+                    drm,
+                )
+                if hasattr(matching_drm, "pssh") and matching_drm.pssh:
+                    if hasattr(matching_drm.pssh, "dumps"):
+                        pssh_str = self.truncate_pssh_for_display(matching_drm.pssh.dumps(), drm_name)
+                    elif hasattr(matching_drm, "data") and matching_drm.data.get("pssh_b64"):
+                        pssh_str = self.truncate_pssh_for_display(matching_drm.data["pssh_b64"], drm_name)
+                if pssh_str:
+                    cek_tree = Tree(Text.assemble((drm_name, "cyan"), (f"({pssh_str})", "text"), overflow="fold"))
+                else:
+                    cek_tree = Tree(Text.assemble((drm_name, "cyan"), overflow="fold"))
+                all_kids = list(getattr(drm, "kids", []))
+                if track_kid and track_kid not in all_kids:
+                    all_kids.append(track_kid)
+                for kid in all_kids:
+                    if kid in drm.content_keys:
+                        is_track_kid = ["", "*"][kid == track_kid]
+                        key = drm.content_keys[kid]
+                        cek_tree.add(f"[text2]{kid.hex}:{key}{is_track_kid}")
+                for kid, key in drm.content_keys.items():
+                    if kid not in all_kids:
+                        cek_tree.add(f"[text2]{kid.hex}:{key}")
+                if not any(isinstance(x, Tree) and x.label == cek_tree.label for x in table.columns[0].cells):
+                    table.add_row(cek_tree)
+            return
+
         track_quality = None
         if isinstance(track, Video) and track.height:
             track_quality = track.height
 
-        if isinstance(drm, Widevine):
-            if not is_widevine_cdm(self.cdm):
-                widevine_cdm = self.get_cdm(self.service, self.profile, drm="widevine", quality=track_quality)
-                if widevine_cdm:
-                    if track_quality:
-                        self.log.info(f"Switching to Widevine CDM for Widevine {track_quality}p content")
-                    else:
-                        self.log.info("Switching to Widevine CDM for Widevine content")
-                    self.cdm = widevine_cdm
+        if not server_cdm:
+            if isinstance(drm, Widevine):
+                if not is_widevine_cdm(self.cdm):
+                    widevine_cdm = self.get_cdm(self.service, self.profile, drm="widevine", quality=track_quality)
+                    if widevine_cdm:
+                        if track_quality:
+                            self.log.info(f"Switching to Widevine CDM for Widevine {track_quality}p content")
+                        else:
+                            self.log.info("Switching to Widevine CDM for Widevine content")
+                        self.cdm = widevine_cdm
 
-        elif isinstance(drm, PlayReady):
-            if not is_playready_cdm(self.cdm):
-                playready_cdm = self.get_cdm(self.service, self.profile, drm="playready", quality=track_quality)
-                if playready_cdm:
-                    if track_quality:
-                        self.log.info(f"Switching to PlayReady CDM for PlayReady {track_quality}p content")
-                    else:
-                        self.log.info("Switching to PlayReady CDM for PlayReady content")
-                    self.cdm = playready_cdm
+            elif isinstance(drm, PlayReady):
+                if not is_playready_cdm(self.cdm):
+                    playready_cdm = self.get_cdm(self.service, self.profile, drm="playready", quality=track_quality)
+                    if playready_cdm:
+                        if track_quality:
+                            self.log.info(f"Switching to PlayReady CDM for PlayReady {track_quality}p content")
+                        else:
+                            self.log.info("Switching to PlayReady CDM for PlayReady content")
+                        self.cdm = playready_cdm
 
         if isinstance(drm, Widevine):
             if self.debug_logger:
@@ -2585,9 +2963,34 @@ class dl:
 
                 for kid in all_kids:
                     if kid in drm.content_keys:
+                        is_track_kid = ["", "*"][kid == track_kid]
+                        key = drm.content_keys[kid]
+                        label = f"[text2]{kid.hex}:{key}{is_track_kid}"
+                        if not any(f"{kid.hex}:{key}" in x.label for x in cek_tree.children):
+                            cek_tree.add(label)
                         continue
 
                     is_track_kid = ["", "*"][kid == track_kid]
+
+                    cached_key = self.LICENSE_KEY_CACHE.get(kid)
+                    if cached_key:
+                        drm.content_keys[kid] = cached_key
+                        label = f"[text2]{kid.hex}:{cached_key}{is_track_kid} from cache"
+                        if not any(f"{kid.hex}:{cached_key}" in x.label for x in cek_tree.children):
+                            cek_tree.add(label)
+                        if self.debug_logger:
+                            self.debug_logger.log(
+                                level="INFO",
+                                operation="license_cache_hit",
+                                service=self.service,
+                                context={
+                                    "kid": kid.hex,
+                                    "content_key": cached_key,
+                                    "track": str(track),
+                                    "drm_type": "Widevine",
+                                },
+                            )
+                        continue
 
                     if not cdm_only:
                         content_key, vault_used = self.vaults.get_key(kid)
@@ -2597,6 +3000,7 @@ class dl:
                             if not any(f"{kid.hex}:{content_key}" in x.label for x in cek_tree.children):
                                 cek_tree.add(label)
                             self.vaults.add_key(kid, content_key, excluding=vault_used)
+                            self.LICENSE_KEY_CACHE[kid] = content_key
 
                             if self.debug_logger:
                                 self.debug_logger.log_vault_query(
@@ -2630,6 +3034,9 @@ class dl:
                     if kid not in drm.content_keys and cdm_only:
                         need_license = True
 
+                if need_license and all(kid in drm.content_keys for kid in all_kids):
+                    need_license = False
+
                 if need_license and not vaults_only:
                     from_vaults = drm.content_keys.copy()
 
@@ -2651,21 +3058,24 @@ class dl:
                         else:
                             drm.get_content_keys(cdm=self.cdm, licence=licence, certificate=certificate)
                     except Exception as e:
-                        if isinstance(e, (Widevine.Exceptions.EmptyLicense, Widevine.Exceptions.CEKNotFound)):
-                            msg = str(e)
+                        if drm.content_keys:
+                            self.log.debug(f"License call failed but keys already in content_keys: {e}")
                         else:
-                            msg = f"An exception occurred in the Service's license function: {e}"
-                        cek_tree.add(f"[logging.level.error]{msg}")
-                        if not pre_existing_tree:
-                            table.add_row(cek_tree)
-                        if self.debug_logger:
-                            self.debug_logger.log_error(
-                                "get_license",
-                                e,
-                                service=self.service,
-                                context={"track": str(track), "exception_type": type(e).__name__},
-                            )
-                        raise e
+                            if isinstance(e, (Widevine.Exceptions.EmptyLicense, Widevine.Exceptions.CEKNotFound)):
+                                msg = str(e)
+                            else:
+                                msg = f"An exception occurred in the Service's license function: {e}"
+                            cek_tree.add(f"[logging.level.error]{msg}")
+                            if not pre_existing_tree:
+                                table.add_row(cek_tree)
+                            if self.debug_logger:
+                                self.debug_logger.log_error(
+                                    "get_license",
+                                    e,
+                                    service=self.service,
+                                    context={"track": str(track), "exception_type": type(e).__name__},
+                                )
+                            raise e
 
                     if self.debug_logger:
                         self.debug_logger.log(
@@ -2695,6 +3105,8 @@ class dl:
                     # So we re-add the keys from vaults earlier overwriting blanks or removed KIDs data.
                     drm.content_keys.update(from_vaults)
 
+                    self.LICENSE_KEY_CACHE.update(drm.content_keys)
+
                     successful_caches = self.vaults.add_keys(drm.content_keys)
                     self.log.info(
                         f"Cached {len(drm.content_keys)} Key{'' if len(drm.content_keys) == 1 else 's'} to "
@@ -2713,24 +3125,7 @@ class dl:
                     table.add_row(cek_tree)
 
                 if export:
-                    keys = {}
-                    if export.is_file():
-                        keys = jsonpickle.loads(export.read_text(encoding="utf8")) or {}
-                    if str(title) not in keys:
-                        keys[str(title)] = {}
-                    if str(track) not in keys[str(title)]:
-                        keys[str(title)][str(track)] = {}
-
-                    track_data = keys[str(title)][str(track)]
-                    track_data["url"] = track.url
-                    track_data["descriptor"] = track.descriptor.name
-
-                    if "keys" not in track_data:
-                        track_data["keys"] = {}
-                    for kid, key in drm.content_keys.items():
-                        track_data["keys"][kid.hex] = key
-
-                    export.write_text(jsonpickle.dumps(keys, indent=4), encoding="utf8")
+                    self.write_export(export, title, track, drm)
 
         elif isinstance(drm, PlayReady):
             if self.debug_logger:
@@ -2769,9 +3164,34 @@ class dl:
 
                 for kid in all_kids:
                     if kid in drm.content_keys:
+                        is_track_kid = ["", "*"][kid == track_kid]
+                        key = drm.content_keys[kid]
+                        label = f"[text2]{kid.hex}:{key}{is_track_kid}"
+                        if not any(f"{kid.hex}:{key}" in x.label for x in cek_tree.children):
+                            cek_tree.add(label)
                         continue
 
                     is_track_kid = ["", "*"][kid == track_kid]
+
+                    cached_key = self.LICENSE_KEY_CACHE.get(kid)
+                    if cached_key:
+                        drm.content_keys[kid] = cached_key
+                        label = f"[text2]{kid.hex}:{cached_key}{is_track_kid} from cache"
+                        if not any(f"{kid.hex}:{cached_key}" in x.label for x in cek_tree.children):
+                            cek_tree.add(label)
+                        if self.debug_logger:
+                            self.debug_logger.log(
+                                level="INFO",
+                                operation="license_cache_hit",
+                                service=self.service,
+                                context={
+                                    "kid": kid.hex,
+                                    "content_key": cached_key,
+                                    "track": str(track),
+                                    "drm_type": "PlayReady",
+                                },
+                            )
+                        continue
 
                     if not cdm_only:
                         content_key, vault_used = self.vaults.get_key(kid)
@@ -2781,6 +3201,7 @@ class dl:
                             if not any(f"{kid.hex}:{content_key}" in x.label for x in cek_tree.children):
                                 cek_tree.add(label)
                             self.vaults.add_key(kid, content_key, excluding=vault_used)
+                            self.LICENSE_KEY_CACHE[kid] = content_key
 
                             if self.debug_logger:
                                 self.debug_logger.log_vault_query(
@@ -2815,31 +3236,37 @@ class dl:
                     if kid not in drm.content_keys and cdm_only:
                         need_license = True
 
+                if need_license and all(kid in drm.content_keys for kid in all_kids):
+                    need_license = False
+
                 if need_license and not vaults_only:
                     from_vaults = drm.content_keys.copy()
 
                     try:
                         drm.get_content_keys(cdm=self.cdm, licence=licence, certificate=certificate)
                     except Exception as e:
-                        if isinstance(e, (PlayReady.Exceptions.EmptyLicense, PlayReady.Exceptions.CEKNotFound)):
-                            msg = str(e)
+                        if drm.content_keys:
+                            self.log.debug(f"License call failed but keys already in content_keys: {e}")
                         else:
-                            msg = f"An exception occurred in the Service's license function: {e}"
-                        cek_tree.add(f"[logging.level.error]{msg}")
-                        if not pre_existing_tree:
-                            table.add_row(cek_tree)
-                        if self.debug_logger:
-                            self.debug_logger.log_error(
-                                "get_license_playready",
-                                e,
-                                service=self.service,
-                                context={
-                                    "track": str(track),
-                                    "exception_type": type(e).__name__,
-                                    "drm_type": "PlayReady",
-                                },
-                            )
-                        raise e
+                            if isinstance(e, (PlayReady.Exceptions.EmptyLicense, PlayReady.Exceptions.CEKNotFound)):
+                                msg = str(e)
+                            else:
+                                msg = f"An exception occurred in the Service's license function: {e}"
+                            cek_tree.add(f"[logging.level.error]{msg}")
+                            if not pre_existing_tree:
+                                table.add_row(cek_tree)
+                            if self.debug_logger:
+                                self.debug_logger.log_error(
+                                    "get_license_playready",
+                                    e,
+                                    service=self.service,
+                                    context={
+                                        "track": str(track),
+                                        "exception_type": type(e).__name__,
+                                        "drm_type": "PlayReady",
+                                    },
+                                )
+                            raise e
 
                     for kid_, key in drm.content_keys.items():
                         is_track_kid_marker = ["", "*"][kid_ == track_kid]
@@ -2848,6 +3275,8 @@ class dl:
                             cek_tree.add(label)
 
                     drm.content_keys.update(from_vaults)
+
+                    self.LICENSE_KEY_CACHE.update(drm.content_keys)
 
                     successful_caches = self.vaults.add_keys(drm.content_keys)
                     self.log.info(
@@ -2867,24 +3296,7 @@ class dl:
                     table.add_row(cek_tree)
 
                 if export:
-                    keys = {}
-                    if export.is_file():
-                        keys = jsonpickle.loads(export.read_text(encoding="utf8")) or {}
-                    if str(title) not in keys:
-                        keys[str(title)] = {}
-                    if str(track) not in keys[str(title)]:
-                        keys[str(title)][str(track)] = {}
-
-                    track_data = keys[str(title)][str(track)]
-                    track_data["url"] = track.url
-                    track_data["descriptor"] = track.descriptor.name
-
-                    if "keys" not in track_data:
-                        track_data["keys"] = {}
-                    for kid, key in drm.content_keys.items():
-                        track_data["keys"][kid.hex] = key
-
-                    export.write_text(jsonpickle.dumps(keys, indent=4), encoding="utf8")
+                    self.write_export(export, title, track, drm)
 
         elif isinstance(drm, MonaLisa):
             with self.DRM_TABLE_LOCK:
@@ -3060,70 +3472,6 @@ class dl:
                 if not cdm_name:
                     return None
 
-        cdm_api = next(iter(x.copy() for x in config.remote_cdm if x["name"] == cdm_name), None)
-        if cdm_api:
-            cdm_type = cdm_api.get("type")
+        from envied.core.cdm import load_cdm
 
-            if cdm_type == "decrypt_labs":
-                del cdm_api["name"]
-                del cdm_api["type"]
-
-                if "secret" not in cdm_api or not cdm_api["secret"]:
-                    if config.decrypt_labs_api_key:
-                        cdm_api["secret"] = config.decrypt_labs_api_key
-                    else:
-                        raise ValueError(
-                            f"No secret provided for DecryptLabs CDM '{cdm_name}' and no global "
-                            "decrypt_labs_api_key configured"
-                        )
-
-                # All DecryptLabs CDMs use DecryptLabsRemoteCDM
-                return DecryptLabsRemoteCDM(service_name=service, vaults=self.vaults, **cdm_api)
-
-            elif cdm_type == "custom_api":
-                del cdm_api["name"]
-                del cdm_api["type"]
-
-                # All Custom API CDMs use CustomRemoteCDM
-                return CustomRemoteCDM(service_name=service, vaults=self.vaults, **cdm_api)
-
-            else:
-                device_type = cdm_api.get("Device Type", cdm_api.get("device_type", ""))
-                if str(device_type).upper() == "PLAYREADY":
-                    return PlayReadyRemoteCdm(
-                        security_level=cdm_api.get("Security Level", cdm_api.get("security_level", 3000)),
-                        host=cdm_api.get("Host", cdm_api.get("host")),
-                        secret=cdm_api.get("Secret", cdm_api.get("secret")),
-                        device_name=cdm_api.get("Device Name", cdm_api.get("device_name")),
-                    )
-                else:
-                    return RemoteCdm(
-                        device_type=cdm_api.get("Device Type", cdm_api.get("device_type", "")),
-                        system_id=cdm_api.get("System ID", cdm_api.get("system_id", "")),
-                        security_level=cdm_api.get("Security Level", cdm_api.get("security_level", 3000)),
-                        host=cdm_api.get("Host", cdm_api.get("host")),
-                        secret=cdm_api.get("Secret", cdm_api.get("secret")),
-                        device_name=cdm_api.get("Device Name", cdm_api.get("device_name")),
-                    )
-
-        prd_path = config.directories.prds / f"{cdm_name}.prd"
-        if not prd_path.is_file():
-            prd_path = config.directories.wvds / f"{cdm_name}.prd"
-        if prd_path.is_file():
-            device = PlayReadyDevice.load(prd_path)
-            return PlayReadyCdm.from_device(device)
-
-        cdm_path = config.directories.wvds / f"{cdm_name}.wvd"
-        if not cdm_path.is_file():
-            raise ValueError(f"{cdm_name} does not exist or is not a file")
-
-        try:
-            device = Device.load(cdm_path)
-        except ConstError as e:
-            if "expected 2 but parsed 1" in str(e):
-                raise ValueError(
-                    f"{cdm_name}.wvd seems to be a v1 WVD file, use `pywidevine migrate --help` to migrate it to v2."
-                )
-            raise ValueError(f"{cdm_name}.wvd is an invalid or corrupt Widevine Device file, {e}")
-
-        return WidevineCdm.from_device(device)
+        return load_cdm(cdm_name, service_name=service, vaults=self.vaults)

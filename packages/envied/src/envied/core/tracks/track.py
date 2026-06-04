@@ -13,7 +13,6 @@ from typing import Any, Callable, Iterable, Optional, Union
 from uuid import UUID
 from zlib import crc32
 
-from curl_cffi.requests import Session as CurlSession
 from langcodes import Language
 from requests import Session
 
@@ -21,11 +20,31 @@ from envied.core import binaries
 from envied.core.cdm.detect import is_playready_cdm, is_widevine_cdm
 from envied.core.config import config
 from envied.core.constants import DOWNLOAD_CANCELLED, DOWNLOAD_LICENCE_ONLY
-from envied.core.downloaders import aria2c, curl_impersonate, n_m3u8dl_re, requests
+from envied.core.downloaders import requests
 from envied.core.drm import DRM_T, PlayReady, Widevine
 from envied.core.events import events
+from envied.core.session import RnetSession
 from envied.core.utilities import get_boxes, try_ensure_utf8
 from envied.core.utils.subprocess import ffprobe
+
+
+def direct_session(session: Union[Session, "RnetSession"]) -> Session:
+    """Vanilla requests.Session with copied headers/cookies, no proxy."""
+    new = Session()
+    headers = getattr(session, "headers", None)
+    if headers is not None:
+        try:
+            new.headers.update(dict(headers))
+        except Exception:
+            pass
+    cookies = getattr(session, "cookies", None)
+    if cookies is not None:
+        jar = getattr(cookies, "jar", None)
+        try:
+            new.cookies.update(jar if jar is not None else cookies)
+        except Exception:
+            pass
+    return new
 
 
 class Track:
@@ -45,6 +64,7 @@ class Track:
         name: Optional[str] = None,
         drm: Optional[Iterable[DRM_T]] = None,
         edition: Optional[str] = None,
+        session: Optional[Union[Session, "RnetSession"]] = None,
         downloader: Optional[Callable] = None,
         downloader_args: Optional[dict] = None,
         from_file: Optional[Path] = None,
@@ -88,12 +108,7 @@ class Track:
                 raise TypeError(f"Expected drm to be an iterable, not {type(drm)}")
 
         if downloader is None:
-            downloader = {
-                "aria2c": aria2c,
-                "curl_impersonate": curl_impersonate,
-                "requests": requests,
-                "n_m3u8dl_re": n_m3u8dl_re,
-            }[config.downloader]
+            downloader = requests
 
         self.path: Optional[Path] = None
         self.url = url
@@ -104,6 +119,7 @@ class Track:
         self.name = name
         self.drm = drm
         self.edition: list[str] = [edition] if isinstance(edition, str) else (edition or [])
+        self.session = session
         self.downloader = downloader
         self.downloader_args = downloader_args
         self.from_file = from_file
@@ -185,12 +201,13 @@ class Track:
 
     def download(
         self,
-        session: Session,
+        session: Union[Session, "RnetSession"],
         prepare_drm: partial,
         max_workers: Optional[int] = None,
         progress: Optional[partial] = None,
         *,
         cdm: Optional[object] = None,
+        no_proxy_download: bool = False,
     ):
         """Download and optionally Decrypt this Track."""
         from envied.core.manifests import DASH, HLS, ISM
@@ -206,16 +223,15 @@ class Track:
 
         proxy = next(iter(session.proxies.values()), None)
 
+        dl_session = session
+        if no_proxy_download and proxy:
+            dl_session = direct_session(session)
+            proxy = None
+
         track_type = self.__class__.__name__
         save_path = config.directories.temp / f"{track_type}_{self.id}.mp4"
         if track_type == "Subtitle":
             save_path = save_path.with_suffix(f".{self.codec.extension}")
-
-        if self.downloader.__name__ == "n_m3u8dl_re" and (
-            self.descriptor == self.Descriptor.URL
-            or track_type in ("Subtitle", "Attachment")
-        ):
-            self.downloader = requests
 
         if self.descriptor != self.Descriptor.URL:
             save_dir = save_path.with_name(save_path.name + "_segments")
@@ -223,11 +239,7 @@ class Track:
             save_dir = save_path.parent
 
         def cleanup():
-            # track file (e.g., "foo.mp4")
             save_path.unlink(missing_ok=True)
-            # aria2c control file (e.g., "foo.mp4.aria2" or "foo.mp4.aria2__temp")
-            save_path.with_suffix(f"{save_path.suffix}.aria2").unlink(missing_ok=True)
-            save_path.with_suffix(f"{save_path.suffix}.aria2__temp").unlink(missing_ok=True)
             if save_dir.exists() and save_dir.name.endswith("_segments"):
                 shutil.rmtree(save_dir)
 
@@ -250,7 +262,7 @@ class Track:
                     save_path=save_path,
                     save_dir=save_dir,
                     progress=progress,
-                    session=session,
+                    session=dl_session,
                     proxy=proxy,
                     max_workers=max_workers,
                     license_widevine=prepare_drm,
@@ -262,7 +274,7 @@ class Track:
                     save_path=save_path,
                     save_dir=save_dir,
                     progress=progress,
-                    session=session,
+                    session=dl_session,
                     proxy=proxy,
                     max_workers=max_workers,
                     license_widevine=prepare_drm,
@@ -274,7 +286,7 @@ class Track:
                     save_path=save_path,
                     save_dir=save_dir,
                     progress=progress,
-                    session=session,
+                    session=dl_session,
                     proxy=proxy,
                     max_workers=max_workers,
                     license_widevine=prepare_drm,
@@ -328,26 +340,23 @@ class Track:
 
                     if DOWNLOAD_LICENCE_ONLY.is_set():
                         progress(downloaded="[yellow]SKIPPED")
-                    elif track_type != "Subtitle" and self.downloader.__name__ == "n_m3u8dl_re":
-                        progress(downloaded="[red]FAILED")
-                        error = f"[N_m3u8DL-RE]: {self.descriptor} is currently not supported"
-                        raise ValueError(error)
                     else:
                         for status_update in self.downloader(
                             urls=self.url,
                             output_dir=save_path.parent,
                             filename=save_path.name,
-                            headers=session.headers,
-                            cookies=session.cookies,
+                            headers=dl_session.headers,
+                            cookies=dl_session.cookies,
                             proxy=proxy,
                             max_workers=max_workers,
+                            session=dl_session,
                         ):
                             file_downloaded = status_update.get("file_downloaded")
                             if not file_downloaded:
+                                downloaded = status_update.get("downloaded")
+                                if downloaded and downloaded.endswith("/s"):
+                                    status_update["downloaded"] = f"URL {downloaded}"
                                 progress(**status_update)
-
-                        # see https://github.com/devine-dl/devine/issues/71
-                        save_path.with_suffix(f"{save_path.suffix}.aria2__temp").unlink(missing_ok=True)
 
                         self.path = save_path
                         events.emit(events.Types.TRACK_DOWNLOADED, track=self)
@@ -429,6 +438,57 @@ class Track:
 
         self.path = target
         return target
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise the track for export/import (identity/URL/descriptor/language).
+
+        DRM is not serialised here; the export writer attaches the licensed DRM + keys.
+        Subclasses add their own codec/quality fields.
+        """
+        data: dict[str, Any] = {
+            "type": self.__class__.__name__,
+            "id": self.id,
+            "url": self.url,
+            "language": str(self.language),
+            "is_original_lang": self.is_original_lang,
+            "descriptor": self.descriptor.name,
+            "needs_repack": self.needs_repack,
+            "name": self.name,
+            "edition": self.edition,
+        }
+        return data
+
+    @staticmethod
+    def base_kwargs_from_dict(data: dict[str, Any]) -> dict[str, Any]:
+        """Build the shared Track constructor kwargs from a ``to_dict()`` payload.
+
+        DRM is not reconstructed here — ``to_dict`` does not serialise it, and the import
+        flow attaches the licensed DRM + content keys separately.
+        """
+        return {
+            "url": data["url"],
+            "language": data.get("language") or "und",
+            "is_original_lang": data.get("is_original_lang", False),
+            "descriptor": Track.Descriptor[data.get("descriptor", "URL")],
+            "needs_repack": data.get("needs_repack", False),
+            "name": data.get("name"),
+            "edition": data.get("edition") or None,
+            "id_": data.get("id"),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Track":
+        """Reconstruct the correct Track subclass from a ``to_dict()`` payload."""
+        from envied.core.tracks.audio import Audio
+        from envied.core.tracks.subtitle import Subtitle
+        from envied.core.tracks.video import Video
+
+        track_type = data.get("type")
+        builders = {"Video": Video, "Audio": Audio, "Subtitle": Subtitle}
+        builder = builders.get(track_type)
+        if builder is None:
+            raise ValueError(f"Cannot reconstruct unsupported track type: {track_type!r}")
+        return builder.from_dict(data)
 
     def get_track_name(self) -> Optional[str]:
         """Get the Track Name."""
@@ -602,8 +662,8 @@ class Track:
             raise TypeError(f"Expected url to be a {str}, not {type(url)}")
         if not isinstance(byte_range, (str, type(None))):
             raise TypeError(f"Expected byte_range to be a {str}, not {type(byte_range)}")
-        if not isinstance(session, (Session, CurlSession, type(None))):
-            raise TypeError(f"Expected session to be a {Session} or {CurlSession}, not {type(session)}")
+        if not isinstance(session, (Session, RnetSession, type(None))):
+            raise TypeError(f"Expected session to be a {Session} or {RnetSession}, not {type(session)}")
 
         if not url:
             if self.descriptor != self.Descriptor.URL:
@@ -641,10 +701,11 @@ class Track:
             init_data = res.content
         else:
             init_data = None
-            with session.get(url, stream=True) as s:
-                for chunk in s.iter_content(content_length):
-                    init_data = chunk
-                    break
+            s = session.get(url, stream=True)
+            for chunk in s.iter_content(content_length):
+                init_data = chunk
+                break
+            s.close()
             if not init_data:
                 raise ValueError(f"Failed to read {content_length} bytes from the track URI.")
 

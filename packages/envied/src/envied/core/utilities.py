@@ -1,5 +1,6 @@
 import ast
 import contextlib
+import gzip
 import importlib.util
 import json
 import logging
@@ -10,6 +11,7 @@ import sys
 import time
 import traceback
 import unicodedata
+import zlib
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,14 +22,12 @@ from uuid import uuid4
 
 import chardet
 import pycountry
-import requests
 from construct import ValidationError
 from fontTools import ttLib
 from langcodes import Language, closest_match
 from pymp4.parser import Box
 from unidecode import unidecode
 
-from envied.core.cacher import Cacher
 from envied.core.config import config
 from envied.core.constants import LANGUAGE_EXACT_DISTANCE, LANGUAGE_MAX_DISTANCE
 
@@ -129,6 +129,8 @@ def sanitize_filename(filename: str, spacer: str = ".") -> str:
     # optionally replace non-ASCII characters with ASCII equivalents
     if not config.unicode_filenames:
         filename = unidecode(filename)
+        filename = re.sub(r"\[\(+", "[", filename)
+        filename = re.sub(r"\)+\]", "]", filename)
 
     # remove or replace further characters as needed
     filename = "".join(c for c in filename if unicodedata.category(c) != "Mn")  # hidden characters
@@ -156,6 +158,18 @@ def is_exact_match(language: Union[str, Language], languages: Sequence[Union[str
     if not languages:
         return False
     return closest_match(language, list(map(str, languages)))[1] <= LANGUAGE_EXACT_DISTANCE
+
+
+def find_missing_langs(
+    requested: Sequence[str],
+    available: Sequence[Union[str, Language, None]],
+    *,
+    exact: bool = False,
+) -> list[str]:
+    """Return requested language tokens with no match in available languages."""
+    match_func = is_exact_match if exact else is_close_match
+    skip = {"all", "best", "orig"}
+    return [tok for tok in requested if tok not in skip and not match_func(tok, available)]
 
 
 def get_boxes(data: bytes, box_type: bytes, as_bytes: bool = False) -> Box:  # type: ignore
@@ -352,111 +366,6 @@ def get_country_code(name: str) -> Optional[str]:
     return None
 
 
-def get_ip_info(session: Optional[requests.Session] = None) -> dict:
-    """
-    Use ipinfo.io to get IP location information.
-
-    If you provide a Requests Session with a Proxy, that proxies IP information
-    is what will be returned.
-    """
-    return (session or requests.Session()).get("https://ipinfo.io/json").json()
-
-
-def get_cached_ip_info(session: Optional[requests.Session] = None) -> Optional[dict]:
-    """
-    Get IP location information with 24-hour caching and fallback providers.
-
-    This function uses a global cache to avoid repeated API calls when the IP
-    hasn't changed. Should only be used for local IP checks, not for proxy verification.
-    Implements smart provider rotation to handle rate limiting (429 errors).
-
-    Args:
-        session: Optional requests session (usually without proxy for local IP)
-
-    Returns:
-        Dict with IP info including 'country' key, or None if all providers fail
-    """
-
-    log = logging.getLogger("get_cached_ip_info")
-    cache = Cacher("global").get("ip_info")
-
-    if cache and not cache.expired:
-        return cache.data
-
-    provider_state_cache = Cacher("global").get("ip_provider_state")
-    provider_state = provider_state_cache.data if provider_state_cache and not provider_state_cache.expired else {}
-
-    providers = {
-        "ipinfo": "https://ipinfo.io/json",
-        "ipapi": "https://ipapi.co/json",
-    }
-
-    session = session or requests.Session()
-    provider_order = ["ipinfo", "ipapi"]
-
-    current_time = time.time()
-    for provider_name in list(provider_order):
-        if provider_name in provider_state:
-            rate_limit_info = provider_state[provider_name]
-            if (current_time - rate_limit_info.get("rate_limited_at", 0)) < 300:
-                log.debug(f"Provider {provider_name} was rate limited recently, trying other provider first")
-                provider_order.remove(provider_name)
-                provider_order.append(provider_name)
-                break
-
-    for provider_name in provider_order:
-        provider_url = providers[provider_name]
-        try:
-            log.debug(f"Trying IP provider: {provider_name}")
-            response = session.get(provider_url, timeout=10)
-
-            if response.status_code == 429:
-                log.warning(f"Provider {provider_name} returned 429 (rate limited), trying next provider")
-                if provider_name not in provider_state:
-                    provider_state[provider_name] = {}
-                provider_state[provider_name]["rate_limited_at"] = current_time
-                provider_state[provider_name]["rate_limit_count"] = (
-                    provider_state[provider_name].get("rate_limit_count", 0) + 1
-                )
-
-                provider_state_cache.set(provider_state, expiration=300)
-                continue
-
-            elif response.status_code == 200:
-                data = response.json()
-                normalized_data = {}
-
-                if "country" in data:
-                    normalized_data = data
-                elif "country_code" in data:
-                    normalized_data = {
-                        "country": data.get("country_code", "").lower(),
-                        "region": data.get("region", ""),
-                        "city": data.get("city", ""),
-                        "ip": data.get("ip", ""),
-                    }
-
-                if normalized_data and "country" in normalized_data:
-                    log.debug(f"Successfully got IP info from provider: {provider_name}")
-
-                    if provider_name in provider_state:
-                        provider_state[provider_name].pop("rate_limited_at", None)
-                        provider_state_cache.set(provider_state, expiration=300)
-
-                    normalized_data["_provider"] = provider_name
-                    cache.set(normalized_data, expiration=86400)
-                    return normalized_data
-            else:
-                log.debug(f"Provider {provider_name} returned status {response.status_code}")
-
-        except Exception as e:
-            log.debug(f"Provider {provider_name} failed with exception: {e}")
-            continue
-
-    log.warning("All IP geolocation providers failed")
-    return None
-
-
 def time_elapsed_since(start: float) -> str:
     """
     Get time elapsed since a timestamp as a string.
@@ -478,12 +387,29 @@ def try_ensure_utf8(data: bytes) -> bytes:
     """
     Try to ensure that the given data is encoded in UTF-8.
 
+    Automatically decompresses gzip/deflate/zlib data before encoding detection.
+    This handles cases where HTTP responses are saved with raw Content-Encoding
+    (e.g., when decode_content=False is used for performance).
+
     Parameters:
         data: Input data that may or may not yet be UTF-8 or another encoding.
 
     Returns the input data encoded in UTF-8 if successful. If unable to detect the
     encoding of the input data, then the original data is returned as-received.
     """
+    # Decompress gzip data (magic bytes: 1f 8b)
+    if data[:2] == b"\x1f\x8b":
+        try:
+            data = gzip.decompress(data)
+        except Exception:
+            pass
+    # Decompress raw deflate/zlib data (common zlib headers: 78 01, 78 5e, 78 9c, 78 da)
+    elif data[:1] == b"\x78" and len(data) > 1 and data[1:2] in (b"\x01", b"\x5e", b"\x9c", b"\xda"):
+        try:
+            data = zlib.decompress(data)
+        except Exception:
+            pass
+
     try:
         data.decode("utf8")
         return data
@@ -497,10 +423,10 @@ def try_ensure_utf8(data: bytes) -> bytes:
                 # last ditch effort to detect encoding
                 detection_result = chardet.detect(data)
                 if not detection_result["encoding"]:
-                    return data
-                return data.decode(detection_result["encoding"]).encode("utf8")
-            except UnicodeDecodeError:
-                return data
+                    return data.decode("utf-8", errors="replace").encode("utf-8")
+                return data.decode(detection_result["encoding"], errors="replace").encode("utf8")
+            except (UnicodeDecodeError, LookupError):
+                return data.decode("utf-8", errors="replace").encode("utf-8")
 
 
 def get_free_port() -> int:

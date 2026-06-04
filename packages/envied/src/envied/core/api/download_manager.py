@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -14,6 +15,11 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 log = logging.getLogger("download_manager")
+
+
+def _sanitize_log(value: object) -> str:
+    """Sanitize a value for safe logging by removing newlines and control characters."""
+    return str(value).replace("\n", "").replace("\r", "").replace("\x00", "")
 
 
 class JobStatus(Enum):
@@ -141,8 +147,37 @@ def _perform_download(
         sub_map.update({c.value.upper(): c for c in Subtitle.Codec})
         params["sub_format"] = sub_map.get(sub_format_raw.upper())
 
-    if params.get("export") and isinstance(params["export"], str):
-        params["export"] = Path(params["export"])
+    if params.get("export"):
+        params["export"] = bool(params["export"])
+
+    # Normalize slow: accept string "MIN-MAX", list/tuple, or True (default 60-120)
+    slow_raw = params.get("slow")
+    if slow_raw is not None and not isinstance(slow_raw, tuple):
+        if isinstance(slow_raw, bool):
+            params["slow"] = (60, 120) if slow_raw else None
+        elif isinstance(slow_raw, list) and len(slow_raw) == 2:
+            params["slow"] = (int(slow_raw[0]), int(slow_raw[1]))
+        elif isinstance(slow_raw, str):
+            from envied.core.utils.click_types import SLOW_DELAY_RANGE
+
+            try:
+                params["slow"] = SLOW_DELAY_RANGE.convert(slow_raw, None, None)
+            except click.BadParameter as exc:
+                raise Exception(f"Invalid slow parameter: {exc}")
+
+    # Convert wanted episode strings to internal "SxE" format
+    # Accepts: "S01E01", "S01-S03", "s1e1", "1x1", or already-parsed format
+    wanted_raw = params.get("wanted")
+    if wanted_raw:
+        from envied.core.utils.click_types import SeasonRange
+
+        if isinstance(wanted_raw, str):
+            wanted_raw = [wanted_raw]
+        # Only convert if not already in internal "SxE" format
+        needs_conversion = any(not re.match(r"^\d+x\d+$", w) for w in wanted_raw)
+        if needs_conversion:
+            season_range = SeasonRange()
+            params["wanted"] = season_range.parse_tokens(*wanted_raw)
 
     # Load service configuration
     service_config_path = Services.get_path(service) / config.filenames.config
@@ -156,10 +191,14 @@ def _perform_download(
 
     ctx = click.Context(dl_command.cli)
     ctx.invoked_subcommand = service
-    ctx.obj = ContextData(config=service_config, cdm=None, proxy_providers=[], profile=params.get("profile"))
+    from envied.core.api.handlers import load_full_cdm
+
+    cdm = load_full_cdm(service, params.get("profile"), params.get("cdm_type"))
+    ctx.obj = ContextData(config=service_config, cdm=cdm, proxy_providers=[], profile=params.get("profile"))
     ctx.params = {
         "proxy": params.get("proxy"),
         "no_proxy": params.get("no_proxy", False),
+        "no_proxy_download": params.get("no_proxy_download", False),
         "profile": params.get("profile"),
         "repack": params.get("repack", False),
         "tag": params.get("tag"),
@@ -266,6 +305,8 @@ def _perform_download(
                 acodec=params.get("acodec"),
                 vbitrate=params.get("vbitrate"),
                 abitrate=params.get("abitrate"),
+                vbitrate_range=params.get("vbitrate_range"),
+                abitrate_range=params.get("abitrate_range"),
                 range_=params.get("range", ["SDR"]),
                 channels=params.get("channels"),
                 no_atmos=params.get("no_atmos", False),
@@ -289,18 +330,20 @@ def _perform_download(
                 no_chapters=params.get("no_chapters", False),
                 no_video=params.get("no_video", False),
                 audio_description=params.get("audio_description", False),
-                slow=params.get("slow", False),
+                slow=params.get("slow", None),
                 list_=False,
                 list_titles=False,
                 skip_dl=params.get("skip_dl", False),
                 export=params.get("export"),
                 cdm_only=params.get("cdm_only"),
                 no_proxy=params.get("no_proxy", False),
+                no_proxy_download=params.get("no_proxy_download", False),
                 no_folder=params.get("no_folder", False),
                 no_source=params.get("no_source", False),
                 no_mux=params.get("no_mux", False),
                 workers=params.get("workers"),
                 downloads=params.get("downloads", 1),
+                worst=params.get("worst", False),
                 best_available=params.get("best_available", False),
                 split_audio=params.get("split_audio"),
             )
@@ -322,9 +365,10 @@ def _perform_download(
         log.error(f"Stderr: {stderr_str}")
         raise
 
-    log.info(f"Download completed for job {job_id}, files in {original_download_dir}")
+    output_files = [str(p) for p in dl_instance.completed_files]
+    log.info(f"Download completed for job {job_id}, {len(output_files)} file(s) in {original_download_dir}")
 
-    return []
+    return output_files
 
 
 class DownloadQueueManager:
@@ -361,7 +405,7 @@ class DownloadQueueManager:
         self._jobs[job_id] = job
         self._job_queue.put_nowait(job)
 
-        log.info(f"Created download job {job_id} for {service}:{title_id}")
+        log.info(f"Created download job {job_id} for {_sanitize_log(service)}:{_sanitize_log(title_id)}")
         return job
 
     def get_job(self, job_id: str) -> Optional[DownloadJob]:
@@ -381,27 +425,27 @@ class DownloadQueueManager:
         if job.status == JobStatus.QUEUED:
             job.status = JobStatus.CANCELLED
             job.cancel_event.set()  # Signal cancellation
-            log.info(f"Cancelled queued job {job_id}")
+            log.info(f"Cancelled queued job {_sanitize_log(job_id)}")
             return True
         elif job.status == JobStatus.DOWNLOADING:
             # Set the cancellation event first - this will be checked by the download thread
             job.cancel_event.set()
             job.status = JobStatus.CANCELLED
-            log.info(f"Signaled cancellation for downloading job {job_id}")
+            log.info(f"Signaled cancellation for downloading job {_sanitize_log(job_id)}")
 
             # Cancel the active download task
             task = self._active_downloads.get(job_id)
             if task:
                 task.cancel()
-                log.info(f"Cancelled download task for job {job_id}")
+                log.info(f"Cancelled download task for job {_sanitize_log(job_id)}")
 
             process = self._download_processes.get(job_id)
             if process:
                 try:
                     process.terminate()
-                    log.info(f"Terminated worker process for job {job_id}")
+                    log.info(f"Terminated worker process for job {_sanitize_log(job_id)}")
                 except ProcessLookupError:
-                    log.debug(f"Worker process for job {job_id} already exited")
+                    log.debug(f"Worker process for job {_sanitize_log(job_id)} already exited")
 
             return True
 
@@ -629,8 +673,11 @@ class DownloadQueueManager:
             if stdout.strip():
                 log.debug(f"Worker stdout for job {job.job_id}: {stdout.strip()}")
             if stderr.strip():
-                log.warning(f"Worker stderr for job {job.job_id}: {stderr.strip()}")
                 job.worker_stderr = stderr.strip()
+                if returncode != 0:
+                    log.warning(f"Worker stderr for job {job.job_id}: {stderr.strip()}")
+                else:
+                    log.debug(f"Worker stderr for job {job.job_id}: {stderr.strip()}")
 
             result_data: Optional[Dict[str, Any]] = None
             try:

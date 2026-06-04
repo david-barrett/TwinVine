@@ -13,7 +13,8 @@ import requests
 
 from envied.core import binaries
 from envied.core.proxies.proxy import Proxy
-from envied.core.utilities import get_country_code, get_country_name, get_debug_logger, get_ip_info
+from envied.core.utilities import get_country_code, get_country_name, get_debug_logger
+from envied.core.utils.ip_info import get_ip_info
 
 # Global registry for cleanup on exit
 _gluetun_instances: list["Gluetun"] = []
@@ -1052,7 +1053,7 @@ class Gluetun(Proxy):
                     # Gluetun needs both proxy listening AND VPN connected
                     # The proxy starts before VPN is ready, so we need to wait for VPN
                     proxy_ready = "[http proxy] listening" in all_logs
-                    vpn_ready = "initialization sequence completed" in all_logs
+                    vpn_ready = "initialization sequence completed" in all_logs or "public ip address is" in all_logs
 
                     if proxy_ready and vpn_ready:
                         # Give a brief moment for the proxy to fully initialize
@@ -1235,10 +1236,10 @@ class Gluetun(Proxy):
                                         duration_ms=duration_ms,
                                     )
                                 raise RuntimeError(
-                                f"Region mismatch for {container['provider']}:{container['region']}: "
-                                f"Expected '{expected_code}' but got '{actual_country}' "
-                                f"(IP: {ip_info.get('ip')}, City: {ip_info.get('city')})"
-                            )
+                                    f"Region mismatch for {container['provider']}:{container['region']}: "
+                                    f"Expected '{expected_code}' but got '{actual_country}' "
+                                    f"(IP: {ip_info.get('ip')}, City: {ip_info.get('city')})"
+                                )
 
                         # Verification successful - store IP info in container record
                         if query_key in self.active_containers:

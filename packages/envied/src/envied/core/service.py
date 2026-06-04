@@ -1,12 +1,14 @@
-import base64
 import logging
 from abc import ABCMeta, abstractmethod
 from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
 from http.cookiejar import CookieJar
 from pathlib import Path
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 from urllib.parse import urlparse, urlunparse
+
+if TYPE_CHECKING:
+    from envied.core.api.input_bridge import InputBridge
 
 import click
 import m3u8
@@ -14,6 +16,7 @@ import requests
 from requests.adapters import HTTPAdapter, Retry
 from rich.padding import Padding
 from rich.rule import Rule
+from rich.text import Text
 
 from envied.core.cacher import Cacher
 from envied.core.config import config
@@ -23,10 +26,10 @@ from envied.core.credential import Credential
 from envied.core.drm import DRM_T
 from envied.core.search_result import SearchResult
 from envied.core.title_cacher import TitleCacher, get_account_hash, get_region_from_proxy
-from envied.core.titles import Title_T, Titles_T
+from envied.core.titles import Title_T, Titles_T, remap_titles
 from envied.core.tracks import Chapters, Tracks
 from envied.core.tracks.video import Video
-from envied.core.utilities import get_cached_ip_info, get_ip_info
+from envied.core.utils.ip_info import get_ip_info
 
 
 @dataclass
@@ -101,11 +104,13 @@ class Service(metaclass=ABCMeta):
         self.session = self.get_session()
         self.cache = Cacher(self.__class__.__name__)
         self.title_cache = TitleCacher(self.__class__.__name__)
+        self.cache_dir = config.directories.cache / self.__class__.__name__
 
         # Store context for cache control flags and credential
         self.ctx = ctx
         self.credential = None  # Will be set in authenticate()
         self.current_region = None  # Will be set based on proxy/geolocation
+        self._input_bridge: Optional[InputBridge] = None
 
         # Set track request from CLI params - services can read/override in their __init__
         vcodec = ctx.parent.params.get("vcodec") if ctx.parent else None
@@ -207,15 +212,10 @@ class Service(metaclass=ABCMeta):
 
             if proxy:
                 self.session.proxies.update({"all": proxy})
-                proxy_parse = urlparse(proxy)
-                if proxy_parse.username and proxy_parse.password:
-                    self.session.headers.update(
-                        {
-                            "Proxy-Authorization": base64.b64encode(
-                                f"{proxy_parse.username}:{proxy_parse.password}".encode("utf8")
-                            ).decode()
-                        }
-                    )
+                # Don't set Proxy-Authorization manually: both rnet (Proxy.all) and
+                # requests authenticate from the credentials embedded in the proxy URL.
+                # A manual header here was malformed (no "Basic " scheme) and broke
+                # plaintext-http forward-proxy requests with HTTP 407.
                 # Always verify proxy IP - proxies can change exit nodes
                 try:
                     proxy_ip_info = get_ip_info(self.session)
@@ -227,7 +227,7 @@ class Service(metaclass=ABCMeta):
             else:
                 # No proxy, use cached IP info for title caching (non-critical)
                 try:
-                    ip_info = get_cached_ip_info(self.session)
+                    ip_info = get_ip_info(self.session, cached=True)
                     self.current_region = ip_info.get("country", "").lower() if ip_info else None
                 except Exception as e:
                     self.log.debug(f"Failed to get cached IP info: {e}")
@@ -271,6 +271,8 @@ class Service(metaclass=ABCMeta):
                         raise
                     if first:
                         all_tracks.add(hdr_tracks, warn_only=True)
+                        if hdr_tracks.manifest_url and not all_tracks.manifest_url:
+                            all_tracks.manifest_url = hdr_tracks.manifest_url
                         first = False
                     else:
                         for video in hdr_tracks.videos:
@@ -289,13 +291,13 @@ class Service(metaclass=ABCMeta):
                     except (ValueError, SystemExit) as e:
                         if self.track_request.best_available:
                             codec_name = codec_val.name if codec_val else "default"
-                            self.log.warning(
-                                f" - {range_val.name}/{codec_name} not available, skipping ({e})"
-                            )
+                            self.log.warning(f" - {range_val.name}/{codec_name} not available, skipping ({e})")
                             continue
                         raise
                     if first:
                         all_tracks.add(tracks, warn_only=True)
+                        if tracks.manifest_url and not all_tracks.manifest_url:
+                            all_tracks.manifest_url = tracks.manifest_url
                         first = False
                     else:
                         for video in tracks.videos:
@@ -349,6 +351,20 @@ class Service(metaclass=ABCMeta):
         # Store credential for cache key generation
         self.credential = credential
 
+    def request_input(self, prompt: str) -> str:
+        """Request interactive input from the user.
+
+        When running locally (CLI), prompts via the shared rich console so the
+        prompt renders correctly alongside Live progress / log handlers.
+        When running in serve mode with an :class:`InputBridge` attached,
+        delegates to the bridge which relays the prompt to the remote client.
+        """
+        if self._input_bridge is not None:
+            return self._input_bridge.request_input(prompt)
+        indent = " " * 5
+        padded = indent + prompt.replace("\n", "\n" + indent)
+        return console.input(Text(padded, style="text"))
+
     def search(self) -> Generator[SearchResult, None, None]:
         """
         Search by query for titles from the Service.
@@ -394,7 +410,9 @@ class Service(metaclass=ABCMeta):
             Decode the data, return as is to reduce unnecessary computations.
         """
 
-    def get_playready_license(self, *, challenge: bytes, title: Title_T, track: AnyTrack) -> Optional[Union[bytes, str]]:
+    def get_playready_license(
+        self, *, challenge: bytes, title: Title_T, track: AnyTrack
+    ) -> Optional[Union[bytes, str]]:
         """
         Get a PlayReady License message by sending a License Request (challenge).
 
@@ -458,7 +476,7 @@ class Service(metaclass=ABCMeta):
             else:
                 # If we can't determine title_id, just call get_titles directly
                 self.log.debug("Cannot determine title_id for caching, bypassing cache")
-                return self.get_titles()
+                return self.apply_title_map(self.get_titles())
 
         # Get cache control flags from context
         no_cache = False
@@ -471,7 +489,7 @@ class Service(metaclass=ABCMeta):
         account_hash = get_account_hash(self.credential)
 
         # Use title cache to get titles with fallback support
-        return self.title_cache.get_cached_titles(
+        titles = self.title_cache.get_cached_titles(
             title_id=str(title_id),
             fetch_function=self.get_titles,
             region=self.current_region,
@@ -479,6 +497,17 @@ class Service(metaclass=ABCMeta):
             no_cache=no_cache,
             reset_cache=reset_cache,
         )
+        return self.apply_title_map(titles)
+
+    def apply_title_map(self, titles: Titles_T) -> Titles_T:
+        """
+        Rewrite service-provided titles using the per-service ``title_map`` config.
+
+        ``title_map`` lives under ``services.<TAG>`` in envied.yaml. Applied after the
+        title cache so config edits take effect without a cache reset, and before any
+        ``--enrich`` override so enrich wins. See ``remap_titles`` for the match rules.
+        """
+        return remap_titles(titles, (self.config or {}).get("title_map") or {})
 
     @abstractmethod
     def get_tracks(self, title: Title_T) -> Tracks:

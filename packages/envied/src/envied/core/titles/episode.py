@@ -100,28 +100,39 @@ class Episode(Title):
 
     def get_filename(self, media_info: MediaInfo, folder: bool = False, show_service: bool = True) -> str:
         if folder:
-            series_template = config.output_template.get("series")
-            if series_template:
-                folder_template = series_template
-                folder_template = re.sub(r'\{episode\}', '', folder_template)
-                folder_template = re.sub(r'\{episode_name\?\}', '', folder_template)
-                folder_template = re.sub(r'\{episode_name\}', '', folder_template)
-                folder_template = re.sub(r'\{season_episode\}', '{season}', folder_template)
-
-                folder_template = re.sub(r'\.{2,}', '.', folder_template)
-                folder_template = re.sub(r'\s{2,}', ' ', folder_template)
-                folder_template = re.sub(r'^[\.\s]+|[\.\s]+$', '', folder_template)
-
-                formatter = TemplateFormatter(folder_template)
+            template = config.get_folder_template("series")
+            if template:
+                formatter = TemplateFormatter(template)
                 context = self._build_template_context(media_info, show_service)
-                context['season'] = f"S{self.season:02}"
+                context["season"] = f"S{self.season:02}"
 
                 folder_name = formatter.format(context)
 
-                if '.' in series_template and ' ' not in series_template:
-                    return sanitize_filename(folder_name, ".")
-                else:
-                    return sanitize_filename(folder_name, " ")
+                separators = re.sub(r"\{[^}]*\}", "", template)
+                spacer = "." if "." in separators and " " not in separators else " "
+                return sanitize_filename(folder_name, spacer)
+
+            series_template = config.output_template.get("series")
+            if series_template:
+                derived_template = series_template
+                derived_template = re.sub(r"\{episode\}", "", derived_template)
+                derived_template = re.sub(r"\{episode_name\?\}", "", derived_template)
+                derived_template = re.sub(r"\{episode_name\}", "", derived_template)
+                derived_template = re.sub(r"\{season_episode\}", "{season}", derived_template)
+
+                derived_template = re.sub(r"\.{2,}", ".", derived_template)
+                derived_template = re.sub(r"\s{2,}", " ", derived_template)
+                derived_template = re.sub(r"^[\.\s]+|[\.\s]+$", "", derived_template)
+
+                formatter = TemplateFormatter(derived_template)
+                context = self._build_template_context(media_info, show_service)
+                context["season"] = f"S{self.season:02}"
+
+                folder_name = formatter.format(context)
+
+                separators = re.sub(r"\{[^}]*\}", "", derived_template)
+                spacer = "." if "." in separators and " " not in separators else " "
+                return sanitize_filename(folder_name, spacer)
             else:
                 name = f"{self.title}"
                 if self.year:
@@ -149,7 +160,7 @@ class Series(SortedKeyList, ABC):
         sum(seasons.values())
         season_breakdown = ", ".join(f"S{season}({count})" for season, count in sorted(seasons.items()))
         tree = Tree(
-            f"{num_seasons} seasons, {season_breakdown}",
+            f"{num_seasons} season{'s'[:num_seasons^1]}, {season_breakdown}",
             guide_style="bright_black",
         )
         if verbose:

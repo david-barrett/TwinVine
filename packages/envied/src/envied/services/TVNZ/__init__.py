@@ -5,6 +5,7 @@ import concurrent.futures
 import json
 import re
 import time
+import uuid
 from collections.abc import Generator
 from http.cookiejar import MozillaCookieJar
 from typing import Any, Optional
@@ -15,6 +16,7 @@ import jwt
 from click import Context
 from langcodes import Language
 from lxml import etree
+from rich.prompt import Prompt
 from envied.core import __version__
 from envied.core.cdm.detect import is_playready_cdm
 from envied.core.config import config
@@ -32,9 +34,9 @@ class TVNZ(Service):
     Service code for TVNZ streaming service (https://www.tvnz.co.nz).
 
     \b
-    Version: 2.0.2
+    Version: 2.0.3
     Author: stabbedbybrick
-    Authorization: tokens
+    Authorization: Credentials (email + OTP)
     Robustness:
       Widevine:
         L3: 1080p, DDP5.1
@@ -53,14 +55,11 @@ class TVNZ(Service):
 
     \b
     Notes:
-        TVNZ has moved to an OTP-only login system, with no username/password and no cookies.
-        Auth sessions are stored in the browser's local storage, so they need to be extracted once
-        before being cached for future use.
-        There are many ways to extract it, but the easiest is with a browser extension, such as
-        "Cookie & Storage Exporter" or similar. Name the exported JSON file 'local_storage.json' and place it 
-        in the `TwinVine/Cache/TVNZ` directory and it'll be added to cache on the next run.
-        Do note that the session can't be shared between browser and script, and will invalidate the other session
-        when tokens are refreshed. It's recommended to use a separate account for ripping purposes.
+        - TVNZ has moved to an OTP-only login system, with no username/password and no cookies.
+          On first run with a new profile, the OTP code will be sent to the email address listed in the config
+          and you will be prompted to enter it. This is only needed once, subsequent logins will use the cached tokens.
+        - Since there are no passwords, simply set the password as 'none' in the config so Unshackle
+          doesn't trip on incorrect formats: 'username:password' -> 'username:none'.
     """
 
     GEOFENCE = ("nz",)
@@ -82,6 +81,20 @@ class TVNZ(Service):
         self.profile = ctx.parent.params.get("profile") or "default"
         self.session.headers.update(self.config["headers"])
 
+        # handle cache and OTP input before calling authenticate() to avoid glitchy terminal
+        self.credential = self.get_credentials(self.__class__.__name__, self.profile)
+        if not self.credential:
+            self.log.error(f" - No credentials found for profile: {self.profile}")
+            exit(1)
+
+        self.cached_tokens = self.cache.get(f"tokens_{self.credential.sha1}")
+        if not self.cached_tokens:
+            self.log.info(" - No cached user tokens found, setting up new login...")
+            self._create_otp(self.credential.username)
+
+            self.log.info(" + OTP code was sent to your email address")
+            self.otp_input = Prompt.ask("\tEnter OTP code")
+
     def search(self) -> Generator[SearchResult, None, None]:
         params = {
             "mode": "detail",
@@ -90,8 +103,8 @@ class TVNZ(Service):
             "pageNumber": "1",
             "pageSize": "50",
             "reg": "nz",
-            "dt": "web",
-            "client": "tvnz-tvnz-web",
+            "dt": "androidtv",
+            "client": "tvnz-tvnz-androidtv",
             "pf": "Regular",
             "allowpg": "true",
         }
@@ -119,19 +132,41 @@ class TVNZ(Service):
     def authenticate(self, cookies: Optional[MozillaCookieJar] = None, credential: Optional[Credential] = None) -> None:
         super().authenticate(cookies, credential)
 
-        user_tokens, session_tokens = self._get_cached_tokens(self.profile)
+        if not self.cached_tokens:
+            if not self.otp_input:
+                raise ValueError("OTP code not provided")
 
-        # If cache is missing or invalid, fallback to local storage
-        if not user_tokens or not session_tokens:
-            user_tokens, session_tokens = self._fetch_and_cache_local_storage(self.profile)
+            otp = self.otp_input.replace(" ", "")
+            device_id = str(uuid.uuid4())
+            confirmation = self._confirm_otp(self.credential.username, otp, device_id)
+            if not (params := confirmation.get("params", [])):
+                raise ValueError("OTP response is missing auth params")
 
-        self.access_token = user_tokens["access_token"]
-        self.device_ref = user_tokens["deviceref"]
-        self.contact_id = user_tokens["contact_id"]
-        self.xauthorization = session_tokens["xauthorization"]
+            tokens = {p.get("paramName"): p.get("paramValue") for p in params}
+            tokens["contactID"] = confirmation.get("contactID")
+            tokens["deviceID"] = device_id
+            self.cached_tokens.set(tokens, expiration=int(tokens["expiresIn"]) - 3600)
 
+        else:
+            if not self.cached_tokens.expired:
+                self.log.info(" + Using cached user tokens")
+                tokens = self.cached_tokens.data
+            else:
+                self.log.info(" + Refreshing cached user tokens")
+                tokens = self.cached_tokens.data.copy()
+                refreshed_data = self._refresh_user_tokens(self.cached_tokens.data)
+                tokens.update(refreshed_data)
+                self.cached_tokens.set(tokens, expiration=int(tokens["expiresIn"]) - 3600)
+
+        self.access_token = tokens["accessToken"]
+        self.device_id = tokens["deviceID"]
+        self.contact_id = tokens["contactID"]
+
+        self.session.headers.update({"Authorization": f"Bearer {self.access_token}"})
+
+        self.xauthorization, _ = self._get_entitlements(self.contact_id)
         self.oauth_token = self._get_oauth_token()
-        self.secret = self._register_app(self.oauth_token, self.xauthorization, self.device_ref)
+        self.secret = self._register_app(self.oauth_token, self.xauthorization, self.device_id)
 
     def get_titles(self) -> Movies | Series:
         match = re.match(self.TITLE_RE, self.title)
@@ -153,49 +188,33 @@ class TVNZ(Service):
             raise ValueError(f"Unsupported content type: {content_type}")
 
     def get_tracks(self, title: Movie | Episode) -> Tracks:
-        device_token = self._get_device_token(self.secret, self.device_ref)
+        device_token = self._get_device_token(self.secret, self.device_id)
 
         headers = {
-            "accept": "*/*",
-            "accept-language": "en-US,en;q=0.9",
             "authorization": f"Bearer {self.oauth_token}",
-            "content-type": "application/json",
-            "origin": "https://tvnz.co.nz",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
             "x-authorization": f"{self.xauthorization}",
-            "x-client-id": "tvnz-tvnz-web",
             "x-device-id": f"{device_token}",
-            "x-device-type": "web",
         }
 
         json_data = {
-            "deviceName": "web",
-            "deviceId": f"{self.device_ref}",
+            "deviceName": "lgwebostv" if self.drm_system == "playready" else "androidtv",
+            "deviceId": self.device_id,
+            "deviceManufacturer": "Android TV",
+            "deviceModelName": "Android TV",
+            "deviceOs": "Android",
+            "deviceOsVersion": "10",
             "contentId": title.id,
+            "mediaFormat": "dash",
             "contentTypeId": "vod",
             "catalogType": title.data.get("cty"),
-            "mediaFormat": "dash",
             "drm": self.drm_system,
             "delivery": "streaming",
+            "quality": "high",
             "disableSsai": "true",
-            "deviceManufacturer": "web",
-            "deviceModelName": "Chrome browser on Windows",
-            "deviceModelNumber": "Chrome",
-            "deviceOs": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+            "supportedResolution": "UHD",
             "supportedAudioCodecs": "mp4a",
             "supportedVideoCodecs": "avc,hevc,av01",
-            "supportedMaxWVSecurityLevel": "L3",
-            "deviceToken": f"{device_token}",
-            "urlParameters": {
-                "vpa": "click",
-                "rdid": f"{self.device_ref}",
-                "is_lat": "0",
-                "npa": "0",
-                "idtype": "dpid",
-                "endpoint": "web",
-                "endpoint-group": "desktop",
-                "endpoint_detail": "desktop",
-            },
+            "supportedMaxWVSecurityLevel": "L1",
         }
 
         response = self.session.post(
@@ -208,7 +227,7 @@ class TVNZ(Service):
         data = response.json()
         if data.get("header", {}).get("message", "").lower() != "success":
             raise ConnectionError(f"Failed to authorize playback: {data}")
-        
+
         title.data["license_url"] = data.get("data", {}).get("licenseUrl")
         title.data["markers"] = title.data.get("mar")
 
@@ -232,7 +251,7 @@ class TVNZ(Service):
     def get_chapters(self, title: Movie | Episode) -> Chapters:
         if not (markers := title.data.get("markers")):
             return Chapters()
-        
+
         chapters = []
         for marker in markers:
             if marker.get("t", "").lower() == "postplay":
@@ -246,34 +265,26 @@ class TVNZ(Service):
 
         return sorted(chapters, key=lambda x: x.timestamp)
 
-    def get_widevine_service_certificate(self, *, challenge: bytes, title: Episode | Movie, track: Any) -> bytes | str | None:
+    def get_widevine_service_certificate(
+        self, *, challenge: bytes, title: Episode | Movie, track: Any
+    ) -> bytes | str | None:
         return None
 
     def get_widevine_license(self, *, challenge: bytes, title: Episode | Movie, track: Any) -> bytes | str | None:
         if not (license_url := title.data.get("license_url")):
             return None
 
-        headers = {
-            'accept': '*/*',
-            'authorization': 'Bearer {}'.format(self.oauth_token),
-            'origin': 'https://tvnz.co.nz',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
-        }
+        headers = {"authorization": "Bearer {}".format(self.oauth_token)}
         r = self.session.post(url=license_url, headers=headers, data=challenge)
         r.raise_for_status()
 
         return r.content
-    
+
     def get_playready_license(self, *, challenge: bytes, title: Episode | Movie, track: Any) -> bytes | str | None:
         if not (license_url := title.data.get("license_url")):
             return None
 
-        headers = {
-            'accept': '*/*',
-            'authorization': 'Bearer {}'.format(self.oauth_token),
-            'origin': 'https://tvnz.co.nz',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
-        }
+        headers = {"authorization": "Bearer {}".format(self.oauth_token)}
         r = self.session.post(url=license_url, headers=headers, data=challenge)
         r.raise_for_status()
 
@@ -292,8 +303,8 @@ class TVNZ(Service):
                     "sortBy": "epnum",
                     "sortOrder": "asc",
                     "reg": "nz",
-                    "dt": "web",
-                    "client": "tvnz-tvnz-web",
+                    "dt": "androidtv",
+                    "client": "tvnz-tvnz-androidtv",
                     "pf": "Regular",
                     "allowpg": "true",
                 },
@@ -301,11 +312,11 @@ class TVNZ(Service):
             )
             response.raise_for_status()
             data = response.json()
-            
+
             if not (episodes := data.get("data")):
                 self.log.error(f"Failed to get episodes for season {season_id}")
                 return []
-            
+
             return [
                 Episode(
                     id_=episode.get("nu"),
@@ -329,8 +340,8 @@ class TVNZ(Service):
             url=self.config["endpoints"]["catalog"] + title_path,
             params={
                 "reg": "nz",
-                "dt": "web",
-                "client": "tvnz-tvnz-web",
+                "dt": "androidtv",
+                "client": "tvnz-tvnz-androidtv",
                 "pf": "Regular",
                 "allowpg": "true",
             },
@@ -350,8 +361,8 @@ class TVNZ(Service):
                 "sortBy": "asc",
                 "sortOrder": "desc",
                 "reg": "nz",
-                "dt": "web",
-                "client": "tvnz-tvnz-web",
+                "dt": "androidtv",
+                "client": "tvnz-tvnz-androidtv",
                 "pf": "Regular",
                 "allowpg": "true",
             },
@@ -362,17 +373,14 @@ class TVNZ(Service):
         seasons = [x.get("id") for x in data["data"]]
         if not seasons:
             raise ValueError(f"Failed to get seasons: {data}")
-        
+
         all_episodes = []
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            futures = [
-                executor.submit(self._fetch_season_episodes, series_id, season) 
-                for season in seasons
-            ]
+            futures = [executor.submit(self._fetch_season_episodes, series_id, season) for season in seasons]
             for future in futures:
                 all_episodes.extend(future.result())
-                
+
         return Series(all_episodes)
 
     def _get_movie(self, title_path: str) -> Movies:
@@ -380,8 +388,8 @@ class TVNZ(Service):
             url=self.config["endpoints"]["catalog"] + title_path,
             params={
                 "reg": "nz",
-                "dt": "web",
-                "client": "tvnz-tvnz-web",
+                "dt": "androidtv",
+                "client": "tvnz-tvnz-androidtv",
                 "pf": "Regular",
                 "allowpg": "true",
             },
@@ -411,8 +419,8 @@ class TVNZ(Service):
             url=self.config["endpoints"]["catalog"] + title_path,
             params={
                 "reg": "nz",
-                "dt": "web",
-                "client": "tvnz-tvnz-web",
+                "dt": "androidtv",
+                "client": "tvnz-tvnz-androidtv",
                 "pf": "Regular",
                 "allowpg": "true",
             },
@@ -439,14 +447,14 @@ class TVNZ(Service):
         ]
 
         return Series(episodes)
-    
+
     def _get_single(self, title_path: str) -> Movies:
         response = self.session.get(
             url=self.config["endpoints"]["catalog"] + title_path,
             params={
                 "reg": "nz",
-                "dt": "web",
-                "client": "tvnz-tvnz-web",
+                "dt": "androidtv",
+                "client": "tvnz-tvnz-androidtv",
                 "pf": "Regular",
                 "allowpg": "true",
             },
@@ -457,7 +465,7 @@ class TVNZ(Service):
 
         if not (video := data.get("data")):
             raise ValueError(f"Failed to get episode: {data}")
-        
+
         events = [
             Movie(
                 id_=video.get("nu"),
@@ -470,8 +478,8 @@ class TVNZ(Service):
         ]
 
         return Movies(events)
-        
-    @staticmethod    
+
+    @staticmethod
     def _get_device_token(secret_b64: str, device_id: str) -> str:
         secret_bytes = base64.b64decode(secret_b64)
 
@@ -479,22 +487,13 @@ class TVNZ(Service):
             "deviceId": device_id,
             "aud": "playback-auth-service",
             "iat": int(time.time()),
-            "exp": int(time.time()) + 30
+            "exp": int(time.time()) + 30,
         }
 
         device_token = jwt.encode(payload, secret_bytes, algorithm="HS256")
         return device_token
-        
-    def _get_entitlements(self, access_token: str, contact_id: str):
-        headers = {
-            "accept": "application/json, text/plain, */*",
-            "accept-language": "en-US,en;q=0.9",
-            "authorization": f"Bearer {access_token}",
-            "content-type": "application/json",
-            "origin": "https://tvnz.co.nz",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
-        }
 
+    def _get_entitlements(self, contact_id: str):
         json_data = {
             "GetEntitlementsRequestMessage": {
                 "contactID": contact_id,
@@ -506,7 +505,6 @@ class TVNZ(Service):
 
         response = self.session.post(
             url=self.config["endpoints"]["entitlements"],
-            headers=headers,
             json=json_data,
             timeout=30,
         )
@@ -514,50 +512,17 @@ class TVNZ(Service):
         data = response.json()
         if data.get("GetEntitlementsResponseMessage").get("message", "").lower() != "success":
             raise ConnectionError(f"Failed to get entitlements: {data}")
-        
+
         token = data.get("GetEntitlementsResponseMessage").get("ovatToken")
         expiry = data.get("GetEntitlementsResponseMessage").get("ovatTokenExpiry")
         if not token:
             raise ValueError(f"Failed to get entitlements: {data}")
-        
+
         return token, expiry
 
-    def _get_contact_id(self, access_token: str):
-        headers = {
-            "accept": "application/json, text/plain, */*",
-            "accept-language": "en-US,en;q=0.9",
-            "authorization": f"Bearer {access_token}",
-            "content-type": "application/json",
-            "origin": "https://tvnz.co.nz",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
-        }
-
-        json_data = {"GetContactRequestMessage": {**self.config["contact"]}}
-
-        response = self.session.post(
-            url=self.config["endpoints"]["contact"],
-            headers=headers,
-            json=json_data,
-            timeout=30,
-        )
-        response.raise_for_status()
-        data = response.json()
-        if data.get("GetContactResponseMessage", {}).get("message", "").lower() != "success":
-            raise ConnectionError(f"Failed to get contact: {data}")
-        
-        return data["GetContactResponseMessage"]["contactMessage"][0]["contactID"]
-
     def _get_oauth_token(self) -> str:
-        headers = {
-            "accept": "*/*",
-            "accept-language": "en-US,en;q=0.9",
-            "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
-            "origin": "https://tvnz.co.nz",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
-        }
-
         data = {
-            **self.config["web_client"],
+            **self.config["androidtv_client"],
             "grant_type": "client_credentials",
             "audience": "edge-service",
             "scope": "offline openid",
@@ -565,7 +530,6 @@ class TVNZ(Service):
 
         response = self.session.post(
             url=self.config["endpoints"]["oauth"],
-            headers=headers,
             data=data,
             timeout=30,
         )
@@ -577,22 +541,16 @@ class TVNZ(Service):
 
         return token
 
-    def _register_app(self, oauth_token: str, xauth: str, deviceref: str) -> str:
+    def _register_app(self, oauth_token: str, xauth: str, device_id: str) -> str:
         headers = {
-            "accept": "*/*",
-            "accept-language": "en-US,en;q=0.9",
             "authorization": f"Bearer {oauth_token}",
-            "content-type": "text/plain;charset=UTF-8",
-            "origin": "https://tvnz.co.nz",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
             "x-authorization": f"{xauth}",
-            "x-client-id": "tvnz-tvnz-web",
         }
 
         response = self.session.post(
             url=self.config["endpoints"]["register"],
             headers=headers,
-            data=json.dumps({"uniqueId": deviceref}),
+            data=json.dumps({"uniqueId": device_id}),
             timeout=30,
         )
         response.raise_for_status()
@@ -600,28 +558,19 @@ class TVNZ(Service):
 
         if not (secret := registration.get("data", {}).get("secret")):
             raise ValueError(f"Failed to register app: {registration}")
-        
-        return secret
-    
-    def _refresh_user_tokens(self, tokens: dict) -> tuple[dict, int]:
-        headers = {
-            "accept": "application/json, text/plain, */*",
-            "accept-language": "en-US,en;q=0.9",
-            "content-type": "application/json",
-            "origin": "https://tvnz.co.nz",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
-        }
 
+        return secret
+
+    def _refresh_user_tokens(self, tokens: dict) -> tuple[dict, int]:
         json_data = {
             "RefreshTokenRequestMessage": {
                 **self.config["contact"],
-                "refreshToken": tokens.get("refresh_token"),
+                "refreshToken": tokens.get("refreshToken"),
             },
         }
 
         response = self.session.post(
             url=self.config["endpoints"]["refresh"],
-            headers=headers,
             json=json_data,
             timeout=30,
         )
@@ -629,104 +578,77 @@ class TVNZ(Service):
         data = response.json()
         if data.get("RefreshTokenResponseMessage", {}).get("message", "").lower() != "success":
             raise ConnectionError(f"Failed to refresh user tokens: {data}")
-        
-        access_token = data["RefreshTokenResponseMessage"]["accessToken"]
-        refresh_token = data["RefreshTokenResponseMessage"]["refreshToken"]
-        expiry = data["RefreshTokenResponseMessage"]["expiresIn"]
 
-        return {"access_token": access_token, "refresh_token": refresh_token}, expiry
-    
-    def _refresh_session_tokens(self, tokens: dict) -> tuple[dict, int]:
-        xauthorization, xexpiry = self._get_entitlements(tokens.get("access_token"), tokens.get("contact_id"))
-        return {"x-authorization": xauthorization}, xexpiry
+        return data.get("RefreshTokenResponseMessage")
 
-    def _get_cached_tokens(self, profile: str) -> tuple[dict | None, dict | None]:
-        user_tokens = self.cache.get(f"{profile}_user_tokens")
-        session_tokens = self.cache.get(f"{profile}_session_tokens")
-
-        if not (user_tokens and session_tokens):
-            return None, None
-
-        if not user_tokens.expired:
-            self.log.info(" + Using cached user tokens")
-            ptokens = user_tokens.data
-        else:
-            self.log.info(" + Refreshing cached user tokens..")
-            ptokens, pexpiry = self._refresh_user_tokens(user_tokens.data)
-            ptokens["deviceref"] = user_tokens.data["deviceref"]
-            ptokens["contact_id"] = user_tokens.data["contact_id"]
-            user_tokens.set(ptokens, expiration=int(pexpiry) - 3600)
-        
-        if not session_tokens.expired:
-            self.log.info(" + Using cached session tokens")
-            xtokens = session_tokens.data
-        else:
-            self.log.info(" + Refreshing cached session tokens..")
-            xtokens, xexpiry = self._refresh_session_tokens(session_tokens.data)
-            session_tokens.set(xtokens, expiration=int(xexpiry) - 3600)
-
-        return ptokens, xtokens
-
-    def _fetch_and_cache_local_storage(self, profile: str) -> tuple[dict, dict]:
-        self.log.info(" + Fetching tokens from local storage JSON..")
-        cache_dir = config.directories.cache / "TVNZ"
-        storage = next((
-            f for f in cache_dir.rglob("*.json")
-            if f.is_file() and any(t in f.name for t in ("localStorage", "local_storage"))
-            ),None,)
-        if not storage:
-            raise EnvironmentError("'localStorage' not found. \nRun 'envied. dl TVNZ --help' for more information.")
-        
-        try:
-            user = json.loads(storage.read_text())
-        except json.JSONDecodeError:
-            raise ValueError(f"'{storage}' is corrupted. \nRun 'envied. dl TVNZ --help' for more information.")
-        
-        access_token = user.get("accessToken")
-        refresh_token = user.get("refreshToken")
-        device_ref = user.get("deviceref")
-
-        for token in (access_token, refresh_token, device_ref):
-            if not token:
-                raise ValueError(
-                    f"Required token '{token}' is missing from '{storage}'. \nRun 'envied. dl TVNZ --help' for more information."
-                )
-        
-        pexpiry = jwt.decode(access_token, options={"verify_signature": False}).get("exp")
-        contact_id = self._get_contact_id(access_token)
-        xauthorization, xexpiry = self._get_entitlements(access_token, contact_id)
-
-        ptokens = {
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "deviceref": device_ref,
-            "contact_id": contact_id,
+    def _create_otp(self, email: str) -> None:
+        json_data = {
+            "CreateOTPRequestMessage": {
+                **self.config["contact"],
+                "email": email,
+            },
         }
-        xtokens = {
-            "xauthorization": xauthorization,
+        response = self.session.post("https://rest-prod-tvnz.evergentpd.com/tvnz/createOTP", json=json_data).json()
+        response_message = response.get("CreateOTPResponseMessage", {})
+        if not response_message.get("isUserExist", False):
+            raise Exception(f"User with email {email} not found. Please check your credentials.")
+        if response_message.get("status", "").lower() != "success":
+            raise Exception(f"Failed to create OTP: {response}")
+
+        return
+
+    def _confirm_otp(self, email: str, otp: str, device_id: str) -> dict:
+        json_data = {
+            "ConfirmOTPRequestMessage": {
+                **self.config["contact"],
+                "email": email,
+                "canCreateAccount": True,
+                "checkDeviceLimit": True,
+                "dmaId": "001",
+                "otp": otp,
+                "isGenerateJWT": True,
+                "isPrivacyPoliciesAccepted": True,
+                "isTAndCAccepted": True,
+                "deviceDetails": {
+                    "deviceType": "Android TV",
+                    "deviceName": "androidtv",
+                    "modelNo": "Android TV",
+                    "appType": "Android",
+                    "serialNo": device_id,
+                },
+            },
         }
 
-        user_tokens = self.cache.get(f"{profile}_user_tokens")
-        session_tokens = self.cache.get(f"{profile}_session_tokens")
+        response = self.session.post("https://rest-prod-tvnz.evergentpd.com/tvnz/confirmOTP", json=json_data).json()
+        response_message = response.get("ConfirmOTPResponseMessage", {})
+        if response_message.get("status", "").lower() != "success":
+            raise Exception(f"Failed to confirm OTP: {response}")
 
-        user_tokens.set(ptokens, expiration=int(pexpiry) - 3600)
-        session_tokens.set(xtokens, expiration=int(xexpiry) - 3600)
+        return response.get("ConfirmOTPResponseMessage", {})
 
-        return ptokens, xtokens
-    
+    @staticmethod
+    def get_credentials(service: str, profile: Optional[str]) -> Optional[Credential]:
+        """We need this method here to avoid circular imports."""
+        credentials = config.credentials.get(service)
+        if credentials:
+            if isinstance(credentials, dict):
+                if profile:
+                    credentials = credentials.get(profile) or credentials.get("default")
+                else:
+                    credentials = credentials.get("default")
+            if credentials:
+                if isinstance(credentials, list):
+                    return Credential(*credentials)
+                return Credential.loads(credentials)  # type: ignore
+
     def _modify_transfer(self, source_manifest: str) -> str:
-        """
-        Change transfer type to "2" until dev branch is merged
-        """
+        """Change transfer type to "2" until dev branch is merged."""
         manifest = DASH.from_url(source_manifest, self.session).manifest
         periods = manifest.findall("Period")
         for period in periods:
             for adaptation_set in period.findall("AdaptationSet"):
                 for prop in adaptation_set.findall("SupplementalProperty"):
-                    if (
-                        prop is not None
-                        and prop.get("schemeIdUri") == "urn:mpeg:mpegB:cicp:TransferCharacteristics"
-                    ):
+                    if prop is not None and prop.get("schemeIdUri") == "urn:mpeg:mpegB:cicp:TransferCharacteristics":
                         prop.set("value", "2")
 
         return etree.tostring(manifest, encoding="unicode")

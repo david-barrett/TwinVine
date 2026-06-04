@@ -179,9 +179,9 @@ class PlayReady:
             pssh_boxes.extend(
                 Box.parse(base64.b64decode(x.uri.split(",")[-1]))
                 for x in (master.session_keys or master.keys)
-                if x and x.keyformat and x.keyformat.lower() in {
-                    f"urn:uuid:{PSSH.SYSTEM_ID}", "com.microsoft.playready"
-                }
+                if x
+                and x.keyformat
+                and x.keyformat.lower() in {f"urn:uuid:{PSSH.SYSTEM_ID}", "com.microsoft.playready"}
             )
 
         init_data = track.get_init_segment(session=session)
@@ -247,6 +247,17 @@ class PlayReady:
     def kid(self) -> Optional[UUID]:
         return next(iter(self.kids), None)
 
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise this DRM instance for export/import (PSSH + KIDs).
+
+        Content keys are stored once at the export's track level, not duplicated here.
+        """
+        return {
+            "system": "PlayReady",
+            "pssh_b64": self.pssh_b64,
+            "kids": [kid.hex for kid in self.kids],
+        }
+
     @property
     def kids(self) -> list[UUID]:
         return self._kids
@@ -295,7 +306,10 @@ class PlayReady:
 
             if challenge:
                 try:
-                    license_res = licence(challenge=challenge)
+                    try:
+                        license_res = licence(challenge=challenge, pssh_b64=self.pssh_b64)
+                    except TypeError:
+                        license_res = licence(challenge=challenge)
                     if isinstance(license_res, bytes):
                         license_str = license_res.decode(errors="ignore")
                     else:
@@ -356,6 +370,15 @@ class PlayReady:
             key_hex = key if isinstance(key, str) else key.hex()
             key_args.extend(["--key", f"{kid_hex}:{key_hex}"])
 
+        # Fallback for tracks whose tenc default_KID is all-zero and whose real
+        # KID is signalled out-of-band: emit a zero-KID entry per content key.
+        zero_kid = "00" * 16
+        existing_kids = {kid.hex if hasattr(kid, "hex") else str(kid).replace("-", "") for kid in self.content_keys}
+        if zero_kid not in existing_kids:
+            for key in self.content_keys.values():
+                key_hex = key if isinstance(key, str) else key.hex()
+                key_args.extend(["--key", f"{zero_kid}:{key_hex}"])
+
         cmd = [
             str(binaries.Mp4decrypt),
             "--show-progress",
@@ -365,7 +388,7 @@ class PlayReady:
         ]
 
         try:
-            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
         except subprocess.CalledProcessError as e:
             error_msg = e.stderr if e.stderr else f"mp4decrypt failed with exit code {e.returncode}"
             raise subprocess.CalledProcessError(e.returncode, cmd, output=e.stdout, stderr=error_msg)
@@ -411,7 +434,9 @@ class PlayReady:
                 [binaries.ShakaPackager, *arguments],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
-                universal_newlines=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
             )
 
             stream_skipped = False

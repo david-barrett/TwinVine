@@ -86,9 +86,7 @@ class Attachment:
                     raise ValueError(f"Failed to download attachment from URL: {e}")
 
         if path is not None and not isinstance(path, (str, Path)):
-            raise ValueError(
-                f"Invalid attachment path type: expected str or Path, got {type(path).__name__}."
-            )
+            raise ValueError(f"Invalid attachment path type: expected str or Path, got {type(path).__name__}.")
 
         if path is not None:
             path = Path(path)
@@ -126,6 +124,10 @@ class Attachment:
 
     def __str__(self) -> str:
         return " | ".join(filter(bool, ["ATT", self.name, self.mime_type, self.description]))
+
+    def to_dict(self) -> dict[str, Optional[str]]:
+        """Serialise a URL-backed attachment for export/import."""
+        return {"url": self.url, "name": self.name, "mime_type": self.mime_type, "description": self.description}
 
     @property
     def id(self) -> str:

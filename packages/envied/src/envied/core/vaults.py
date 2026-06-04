@@ -1,9 +1,12 @@
+import logging
 from typing import Any, Iterator, Optional, Union
 from uuid import UUID
 
 from envied.core.config import config
 from envied.core.utilities import import_module_by_path
 from envied.core.vault import Vault
+
+log = logging.getLogger(__name__)
 
 _VAULTS = sorted(
     (path for path in config.directories.vaults.glob("*.py") if path.stem.lower() != "__init__"), key=lambda x: x.stem
@@ -48,7 +51,13 @@ class Vaults:
     def get_key(self, kid: Union[UUID, str]) -> tuple[Optional[str], Optional[Vault]]:
         """Get Key from the first Vault it can by KID (Key ID) and Service."""
         for vault in self.vaults:
-            key = vault.get_key(kid, self.service)
+            try:
+                key = vault.get_key(kid, self.service)
+            except (PermissionError, NotImplementedError):
+                continue
+            except Exception as e:
+                log.warning(f"Failed to get key from Vault '{vault.name}': {e}")
+                continue
             if key and key.count("0") != len(key):
                 return key, vault
         return None, None
@@ -62,6 +71,8 @@ class Vaults:
                     success += vault.add_key(self.service, kid, key)
                 except (PermissionError, NotImplementedError):
                     pass
+                except Exception as e:
+                    log.warning(f"Failed to add key to Vault '{vault.name}': {e}")
         return success
 
     def add_keys(self, kid_keys: dict[Union[UUID, str], str]) -> int:
@@ -79,6 +90,8 @@ class Vaults:
                     success += 1
                 except (PermissionError, NotImplementedError):
                     pass
+                except Exception as e:
+                    log.warning(f"Failed to add keys to Vault '{vault.name}': {e}")
         return success
 
 

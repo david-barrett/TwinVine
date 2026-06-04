@@ -1,14 +1,18 @@
 import logging
 import re
 
+import click
 from aiohttp import web
 from aiohttp_swagger3 import SwaggerDocs, SwaggerInfo, SwaggerUiSettings
 
 from envied.core import __version__
 from envied.core.api.errors import APIError, APIErrorCode, build_error_response, handle_api_exception
-from envied.core.api.handlers import (cancel_download_job_handler, download_handler, get_download_job_handler,
-                                         list_download_jobs_handler, list_titles_handler, list_tracks_handler,
-                                         search_handler)
+from envied.core.api.handlers import (cancel_download_job_handler, download_handler, get_allowed_services,
+                                         get_download_job_handler, list_download_jobs_handler, list_titles_handler,
+                                         list_tracks_handler, search_handler, session_create_handler,
+                                         session_delete_handler, session_info_handler, session_license_handler,
+                                         session_prompt_get_handler, session_prompt_post_handler,
+                                         session_segments_handler, session_titles_handler, session_tracks_handler)
 from envied.core.services import Services
 from envied.core.update_checker import UpdateChecker
 
@@ -25,7 +29,7 @@ async def cors_middleware(request: web.Request, handler):
     # Add CORS headers
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Secret-Key, Authorization"
     response.headers["Access-Control-Max-Age"] = "3600"
 
     return response
@@ -151,6 +155,9 @@ async def services(request: web.Request) -> web.Response:
     """
     try:
         service_tags = Services.get_tags()
+        allowed = get_allowed_services(request)
+        if allowed is not None:
+            service_tags = [t for t in service_tags if t in allowed]
         services_info = []
 
         for tag in service_tags:
@@ -185,6 +192,32 @@ async def services(request: web.Request) -> web.Response:
                 if hasattr(service_module, "cli") and hasattr(service_module.cli, "short_help"):
                     service_data["url"] = service_module.cli.short_help
 
+                if hasattr(service_module, "cli") and hasattr(service_module.cli, "params"):
+                    cli_params = []
+                    for param in service_module.cli.params:
+                        param_info: dict = {"name": getattr(param, "name", None)}
+                        if isinstance(param, click.Argument):
+                            param_info["kind"] = "argument"
+                            param_info["required"] = param.required
+                        else:
+                            param_info["kind"] = "option"
+                            param_info["opts"] = list(param.opts) if hasattr(param, "opts") else []
+                            param_info["is_flag"] = getattr(param, "is_flag", False)
+                            default = param.default
+                            if default is None:
+                                pass
+                            elif callable(default) or type(default).__name__ == "Sentinel":
+                                default = None
+                            elif hasattr(default, "name"):
+                                default = default.name
+                            elif not isinstance(default, (str, int, float, bool, list)):
+                                default = str(default)
+                            param_info["default"] = default
+                            param_info["help"] = getattr(param, "help", None)
+                            param_info["type"] = param.type.name if hasattr(param.type, "name") else str(param.type)
+                        cli_params.append(param_info)
+                    service_data["cli_params"] = cli_params
+
                 if service_module.__doc__:
                     service_data["help"] = service_module.__doc__.strip()
 
@@ -218,7 +251,7 @@ async def search(request: web.Request) -> web.Response:
             properties:
               service:
                 type: string
-                description: Service tag (e.g., NF, AMZN, ATV)
+                description: Service tag
               query:
                 type: string
                 description: Search query string
@@ -597,8 +630,10 @@ async def download(request: web.Request) -> web.Response:
                 type: boolean
                 description: Download audio description tracks (default - false)
               slow:
-                type: boolean
-                description: Add 60-120s delay between downloads (default - false)
+                oneOf:
+                  - type: boolean
+                  - type: string
+                description: Add randomized delay between downloads. `true` for default 60-120s, or `"MIN-MAX"` string (e.g., `"20-40"`). Min must be >= 20 (default - null)
               split_audio:
                 type: boolean
                 description: Create separate output files per audio codec instead of merging all audio (default - null)
@@ -606,8 +641,8 @@ async def download(request: web.Request) -> web.Response:
                 type: boolean
                 description: Skip downloading, only retrieve decryption keys (default - false)
               export:
-                type: string
-                description: Path to export decryption keys as JSON (default - None)
+                type: boolean
+                description: Export manifest, track URLs, keys, and subtitles to JSON in the exports directory (default - false)
               cdm_only:
                 type: boolean
                 description: Only use CDM for key retrieval (true) or only vaults (false) (default - None)
@@ -617,6 +652,9 @@ async def download(request: web.Request) -> web.Response:
               no_proxy:
                 type: boolean
                 description: Force disable all proxy use (default - false)
+              no_proxy_download:
+                type: boolean
+                description: Bypass proxy for segment downloads only. Manifest, license, and auth still use proxy (default - false)
               tag:
                 type: string
                 description: Set the group tag to be used (default - None)
@@ -647,6 +685,9 @@ async def download(request: web.Request) -> web.Response:
               best_available:
                 type: boolean
                 description: Continue with best available if requested quality unavailable (default - false)
+              worst:
+                type: boolean
+                description: Select the lowest bitrate track within the specified quality. Requires `quality` (default - false)
               repack:
                 type: boolean
                 description: Add REPACK tag to the output filename (default - false)
@@ -836,8 +877,429 @@ async def cancel_download_job(request: web.Request) -> web.Response:
         return build_error_response(e, debug_mode)
 
 
-def setup_routes(app: web.Application) -> None:
-    """Setup all API routes."""
+async def session_create(request: web.Request) -> web.Response:
+    """
+    Create a remote-dl session.
+    ---
+    summary: Create session
+    description: Authenticate with a service, get titles, tracks, and chapters in one call
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: true
+            required:
+              - service
+              - title_id
+            properties:
+              service:
+                type: string
+              title_id:
+                type: string
+              credentials:
+                type: object
+                additionalProperties: true
+              cookies:
+                type: string
+              proxy:
+                type: string
+              no_proxy:
+                type: boolean
+              profile:
+                type: string
+              cache:
+                type: object
+                additionalProperties: true
+    responses:
+      '200':
+        description: Session created with titles, tracks, and chapters
+      '400':
+        description: Invalid request
+      '401':
+        description: Authentication failed
+    """
+    try:
+        data = await request.json()
+    except Exception as e:
+        return build_error_response(
+            APIError(APIErrorCode.INVALID_INPUT, "Invalid JSON request body", details={"error": str(e)}),
+            request.app.get("debug_api", False),
+        )
+    try:
+        return await session_create_handler(data, request)
+    except APIError as e:
+        return build_error_response(e, request.app.get("debug_api", False))
+    except Exception as e:
+        log.exception("Error in session create")
+        return handle_api_exception(
+            e, context={"operation": "session_create"}, debug_mode=request.app.get("debug_api", False)
+        )
+
+
+async def session_titles(request: web.Request) -> web.Response:
+    """
+    Get titles for an authenticated session.
+    ---
+    summary: Get titles
+    description: Fetch titles from the authenticated service session
+    parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+    responses:
+      '200':
+        description: List of titles
+      '404':
+        description: Session not found
+    """
+    session_id = request.match_info["session_id"]
+    try:
+        return await session_titles_handler(session_id, request)
+    except APIError as e:
+        return build_error_response(e, request.app.get("debug_api", False))
+    except Exception as e:
+        log.exception("Error in session titles")
+        return handle_api_exception(
+            e, context={"operation": "session_titles"}, debug_mode=request.app.get("debug_api", False)
+        )
+
+
+async def session_tracks(request: web.Request) -> web.Response:
+    """
+    Get tracks and chapters for a specific title.
+    ---
+    summary: Get tracks
+    description: Fetch tracks and chapters for a title in the session
+    parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required:
+              - title_id
+            properties:
+              title_id:
+                type: string
+                description: ID of the title to get tracks for
+    responses:
+      '200':
+        description: Tracks and chapters for the title
+      '404':
+        description: Session or title not found
+    """
+    session_id = request.match_info["session_id"]
+    try:
+        data = await request.json()
+    except Exception as e:
+        return build_error_response(
+            APIError(APIErrorCode.INVALID_INPUT, "Invalid JSON request body", details={"error": str(e)}),
+            request.app.get("debug_api", False),
+        )
+    try:
+        return await session_tracks_handler(data, session_id, request)
+    except APIError as e:
+        return build_error_response(e, request.app.get("debug_api", False))
+    except Exception as e:
+        log.exception("Error in session tracks")
+        return handle_api_exception(
+            e, context={"operation": "session_tracks"}, debug_mode=request.app.get("debug_api", False)
+        )
+
+
+async def session_segments(request: web.Request) -> web.Response:
+    """
+    Resolve segment URLs for selected tracks.
+    ---
+    summary: Resolve segments
+    description: Get download URLs, DRM info, and headers for selected tracks
+    parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required:
+              - track_ids
+            properties:
+              track_ids:
+                type: array
+                items:
+                  type: string
+                description: List of track IDs to resolve
+    responses:
+      '200':
+        description: Segment URLs and DRM info for each track
+      '404':
+        description: Session or track not found
+    """
+    session_id = request.match_info["session_id"]
+    try:
+        data = await request.json()
+    except Exception as e:
+        return build_error_response(
+            APIError(APIErrorCode.INVALID_INPUT, "Invalid JSON request body", details={"error": str(e)}),
+            request.app.get("debug_api", False),
+        )
+    try:
+        return await session_segments_handler(data, session_id, request)
+    except APIError as e:
+        return build_error_response(e, request.app.get("debug_api", False))
+    except Exception as e:
+        log.exception("Error in session segments")
+        return handle_api_exception(
+            e, context={"operation": "session_segments"}, debug_mode=request.app.get("debug_api", False)
+        )
+
+
+async def session_license(request: web.Request) -> web.Response:
+    """
+    Proxy DRM license through authenticated service.
+    ---
+    summary: Proxy license
+    description: Forward a CDM challenge to the service's license endpoint
+    parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required:
+              - track_id
+              - challenge
+            properties:
+              track_id:
+                type: string
+                description: Track ID this license is for
+              challenge:
+                type: string
+                description: Base64-encoded CDM challenge
+              drm_type:
+                type: string
+                enum: [widevine, playready]
+                description: DRM type (default widevine)
+    responses:
+      '200':
+        description: License response
+      '404':
+        description: Session or track not found
+    """
+    session_id = request.match_info["session_id"]
+    try:
+        data = await request.json()
+    except Exception as e:
+        return build_error_response(
+            APIError(APIErrorCode.INVALID_INPUT, "Invalid JSON request body", details={"error": str(e)}),
+            request.app.get("debug_api", False),
+        )
+    try:
+        return await session_license_handler(data, session_id, request)
+    except APIError as e:
+        return build_error_response(e, request.app.get("debug_api", False))
+    except Exception as e:
+        log.exception("Error in session license")
+        return handle_api_exception(
+            e, context={"operation": "session_license"}, debug_mode=request.app.get("debug_api", False)
+        )
+
+
+async def session_info(request: web.Request) -> web.Response:
+    """
+    Get session info.
+    ---
+    summary: Session info
+    description: Check session validity and get metadata
+    parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+    responses:
+      '200':
+        description: Session info
+      '404':
+        description: Session not found
+    """
+    session_id = request.match_info["session_id"]
+    try:
+        return await session_info_handler(session_id, request)
+    except APIError as e:
+        return build_error_response(e, request.app.get("debug_api", False))
+
+
+async def session_delete(request: web.Request) -> web.Response:
+    """
+    Delete a session.
+    ---
+    summary: Delete session
+    description: Clean up a remote-dl session
+    parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+    responses:
+      '200':
+        description: Session deleted
+      '404':
+        description: Session not found
+    """
+    session_id = request.match_info["session_id"]
+    try:
+        return await session_delete_handler(session_id, request)
+    except APIError as e:
+        return build_error_response(e, request.app.get("debug_api", False))
+
+
+async def session_prompt_get(request: web.Request) -> web.Response:
+    """
+    Poll for pending interactive prompts during authentication.
+    ---
+    summary: Get auth prompt
+    description: Poll for pending interactive prompts (OTP, device code, PIN) during session authentication
+    parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+    responses:
+      '200':
+        description: Auth status and optional prompt
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status:
+                  type: string
+                  enum: [authenticating, pending_input, authenticated, failed]
+                prompt:
+                  type: string
+                  description: Prompt to display to the user (only when status is pending_input)
+                error:
+                  type: string
+                  description: Error message (only when status is failed)
+      '404':
+        description: Session not found
+    """
+    session_id = request.match_info["session_id"]
+    try:
+        return await session_prompt_get_handler(session_id, request)
+    except APIError as e:
+        return build_error_response(e, request.app.get("debug_api", False))
+    except Exception as e:
+        log.exception("Error in session prompt get")
+        return handle_api_exception(
+            e, context={"operation": "session_prompt_get"}, debug_mode=request.app.get("debug_api", False)
+        )
+
+
+async def session_prompt_submit(request: web.Request) -> web.Response:
+    """
+    Submit a response to a pending interactive prompt.
+    ---
+    summary: Submit prompt response
+    description: Submit user input (OTP code, PIN, device code confirmation) to unblock server authentication
+    parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required:
+              - response
+            properties:
+              response:
+                type: string
+                description: User's response to the prompt
+    responses:
+      '200':
+        description: Response accepted
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status:
+                  type: string
+                  example: accepted
+      '400':
+        description: No prompt pending or invalid request
+      '404':
+        description: Session not found
+    """
+    session_id = request.match_info["session_id"]
+    try:
+        data = await request.json()
+    except Exception as e:
+        return build_error_response(
+            APIError(APIErrorCode.INVALID_INPUT, "Invalid JSON request body", details={"error": str(e)}),
+            request.app.get("debug_api", False),
+        )
+    try:
+        return await session_prompt_post_handler(data, session_id, request)
+    except APIError as e:
+        return build_error_response(e, request.app.get("debug_api", False))
+    except Exception as e:
+        log.exception("Error in session prompt submit")
+        return handle_api_exception(
+            e, context={"operation": "session_prompt_submit"}, debug_mode=request.app.get("debug_api", False)
+        )
+
+
+def _setup_remote_session_routes(app: web.Application) -> None:
+    """Setup remote-DL session endpoints only."""
+    app.router.add_get("/api/health", health)
+    app.router.add_get("/api/services", services)
+    app.router.add_post("/api/search", search)
+    app.router.add_post("/api/session/create", session_create)
+    app.router.add_get("/api/session/{session_id}/titles", session_titles)
+    app.router.add_post("/api/session/{session_id}/tracks", session_tracks)
+    app.router.add_post("/api/session/{session_id}/segments", session_segments)
+    app.router.add_post("/api/session/{session_id}/license", session_license)
+    app.router.add_get("/api/session/{session_id}/prompt", session_prompt_get)
+    app.router.add_post("/api/session/{session_id}/prompt", session_prompt_submit)
+    app.router.add_get("/api/session/{session_id}", session_info)
+    app.router.add_delete("/api/session/{session_id}", session_delete)
+
+
+def setup_routes(app: web.Application, remote_only: bool = False) -> None:
+    """Setup API routes. When remote_only=True, only expose remote session endpoints."""
+    if remote_only:
+        _setup_remote_session_routes(app)
+        return
+
     app.router.add_get("/api/health", health)
     app.router.add_get("/api/services", services)
     app.router.add_post("/api/search", search)
@@ -847,6 +1309,17 @@ def setup_routes(app: web.Application) -> None:
     app.router.add_get("/api/download/jobs", download_jobs)
     app.router.add_get("/api/download/jobs/{job_id}", download_job_detail)
     app.router.add_delete("/api/download/jobs/{job_id}", cancel_download_job)
+
+    # Remote-DL session endpoints
+    app.router.add_post("/api/session/create", session_create)
+    app.router.add_get("/api/session/{session_id}/titles", session_titles)
+    app.router.add_post("/api/session/{session_id}/tracks", session_tracks)
+    app.router.add_post("/api/session/{session_id}/segments", session_segments)
+    app.router.add_post("/api/session/{session_id}/license", session_license)
+    app.router.add_get("/api/session/{session_id}/prompt", session_prompt_get)
+    app.router.add_post("/api/session/{session_id}/prompt", session_prompt_submit)
+    app.router.add_get("/api/session/{session_id}", session_info)
+    app.router.add_delete("/api/session/{session_id}", session_delete)
 
 
 def setup_swagger(app: web.Application) -> None:
@@ -873,5 +1346,15 @@ def setup_swagger(app: web.Application) -> None:
             web.get("/api/download/jobs", download_jobs),
             web.get("/api/download/jobs/{job_id}", download_job_detail),
             web.delete("/api/download/jobs/{job_id}", cancel_download_job),
+            # Remote-DL session endpoints
+            web.post("/api/session/create", session_create),
+            web.get("/api/session/{session_id}/titles", session_titles),
+            web.post("/api/session/{session_id}/tracks", session_tracks),
+            web.post("/api/session/{session_id}/segments", session_segments),
+            web.post("/api/session/{session_id}/license", session_license),
+            web.get("/api/session/{session_id}/prompt", session_prompt_get),
+            web.post("/api/session/{session_id}/prompt", session_prompt_submit),
+            web.get("/api/session/{session_id}", session_info),
+            web.delete("/api/session/{session_id}", session_delete),
         ]
     )

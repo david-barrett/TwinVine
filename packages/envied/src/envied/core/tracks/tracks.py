@@ -39,12 +39,14 @@ class Tracks:
         *args: Union[
             Tracks, Sequence[Union[AnyTrack, Chapter, Chapters, Attachment]], Track, Chapter, Chapters, Attachment
         ],
+        manifest_url: Optional[str] = None,
     ):
         self.videos: list[Video] = []
         self.audio: list[Audio] = []
         self.subtitles: list[Subtitle] = []
         self.chapters = Chapters()
         self.attachments: list[Attachment] = []
+        self.manifest_url: Optional[str] = manifest_url
 
         if args:
             self.add(args)
@@ -195,6 +197,8 @@ class Tracks:
     ) -> None:
         """Add a provided track to its appropriate array and ensuring it's not a duplicate."""
         if isinstance(tracks, Tracks):
+            if tracks.manifest_url and not self.manifest_url:
+                self.manifest_url = tracks.manifest_url
             tracks = [*list(tracks), *tracks.chapters, *tracks.attachments]
 
         duplicates = 0
@@ -245,12 +249,21 @@ class Tracks:
             self.videos.sort(key=lambda x: str(x.language))
             self.videos.sort(key=lambda x: not is_close_match(language, [x.language]))
 
-    def sort_audio(self, by_language: Optional[Sequence[Union[str, Language]]] = None) -> None:
-        """Sort audio tracks by bitrate, Atmos, descriptive, and optionally language."""
+    def sort_audio(
+        self,
+        by_language: Optional[Sequence[Union[str, Language]]] = None,
+        codec_priority: Optional[Sequence[str]] = None,
+    ) -> None:
+        """Sort audio tracks by bitrate, codec priority, Atmos, descriptive, and optionally language."""
         if not self.audio:
             return
         # bitrate (highest first)
         self.audio.sort(key=lambda x: float(x.bitrate or 0.0), reverse=True)
+        # codec priority (listed codecs ranked in order; unlisted fall to end with bitrate order preserved)
+        if codec_priority:
+            rank = {str(c).upper(): i for i, c in enumerate(codec_priority)}
+            default_rank = len(rank)
+            self.audio.sort(key=lambda x: rank.get(x.codec.name if x.codec else "", default_rank))
         # Atmos tracks first (prioritize over higher bitrate non-Atmos)
         self.audio.sort(key=lambda x: not x.atmos)
         # descriptive tracks last
@@ -302,25 +315,48 @@ class Tracks:
     def select_subtitles(self, x: Callable[[Subtitle], bool]) -> None:
         self.subtitles = list(filter(x, self.subtitles))
 
-    def select_hybrid(self, tracks, quality):
+    def filter(self, predicate: Callable[[AnyTrack], bool]) -> Tracks:
+        """Return a new Tracks with tracks filtered by predicate, preserving metadata."""
+        new_tracks = Tracks(manifest_url=self.manifest_url)
+        new_tracks.videos = [t for t in self.videos if predicate(t)]
+        new_tracks.audio = [t for t in self.audio if predicate(t)]
+        new_tracks.subtitles = [t for t in self.subtitles if predicate(t)]
+        new_tracks.chapters = self.chapters
+        new_tracks.attachments = list(self.attachments)
+        return new_tracks
+
+    @staticmethod
+    def merge_video_selections(*groups: list[Video]) -> list[Video]:
+        """Concatenate video selections, dropping duplicates (by track id, order-preserving).
+
+        A DV track can be chosen as both the hybrid ingredient (lowest) and an explicit
+        deliverable; without dedup the same track would be muxed/downloaded twice.
+        """
+        merged: list[Video] = []
+        for group in groups:
+            for video in group:
+                if video not in merged:
+                    merged.append(video)
+        return merged
+
+    def select_hybrid(self, tracks, quality, worst: bool = False):
         # Prefer HDR10+ over HDR10 as the base layer (preserves dynamic metadata)
         base_ranges = (Video.Range.HDR10P, Video.Range.HDR10)
         base_tracks = []
         for range_type in base_ranges:
             base_tracks = [
-                v
-                for v in tracks
-                if v.range == range_type and (v.height in quality or int(v.width * 9 / 16) in quality)
+                v for v in tracks if v.range == range_type and (v.height in quality or int(v.width * 9 / 16) in quality)
             ]
             if base_tracks:
                 break
 
+        pick = min if worst else max
         base_selected = []
         for res in quality:
             candidates = [v for v in base_tracks if v.height == res or int(v.width * 9 / 16) == res]
             if candidates:
-                best = max(candidates, key=lambda v: v.bitrate)
-                base_selected.append(best)
+                chosen = pick(candidates, key=lambda v: v.bitrate)
+                base_selected.append(chosen)
 
         dv_tracks = [v for v in tracks if v.range == Video.Range.DV]
         lowest_dv = min(dv_tracks, key=lambda v: v.height) if dv_tracks else None
@@ -415,13 +451,40 @@ class Tracks:
         if config.muxing.get("set_title", True):
             cl.extend(["--title", title])
 
+        default_language = config.muxing.get("default_language") or {}
+        preferred_video_lang = default_language.get("video")
+        preferred_audio_lang = default_language.get("audio")
+        preferred_subtitle_lang = default_language.get("subtitle")
+
+        preferred_video_idx: Optional[int] = None
+        if preferred_video_lang:
+            preferred_video_idx = next(
+                (idx for idx, v in enumerate(self.videos) if is_close_match(v.language, [preferred_video_lang])),
+                None,
+            )
+
+        preferred_audio_idx: Optional[int] = None
+        if preferred_audio_lang:
+            preferred_audio_idx = next(
+                (idx for idx, a in enumerate(self.audio) if is_close_match(a.language, [preferred_audio_lang])),
+                None,
+            )
+
+        preferred_subtitle_idx: Optional[int] = None
+        if preferred_subtitle_lang and not skip_subtitles:
+            preferred_subtitle_idx = next(
+                (idx for idx, s in enumerate(self.subtitles) if is_close_match(s.language, [preferred_subtitle_lang])),
+                None,
+            )
+
         for i, vt in enumerate(self.videos):
             if not vt.path or not vt.path.exists():
                 raise ValueError("Video Track must be downloaded before muxing...")
             events.emit(events.Types.TRACK_MULTIPLEX, track=vt)
 
-            is_default = False
-            if title_language:
+            if preferred_video_idx is not None:
+                is_default = i == preferred_video_idx
+            elif title_language:
                 is_default = vt.language == title_language
                 if not any(v.language == title_language for v in self.videos):
                     is_default = vt.is_original_lang or i == 0
@@ -477,6 +540,10 @@ class Tracks:
             if not at.path or not at.path.exists():
                 raise ValueError("Audio Track must be downloaded before muxing...")
             events.emit(events.Types.TRACK_MULTIPLEX, track=at)
+            if preferred_audio_idx is not None:
+                audio_default = i == preferred_audio_idx
+            else:
+                audio_default = at.is_original_lang
             cl.extend(
                 [
                     "--track-name",
@@ -484,7 +551,7 @@ class Tracks:
                     "--language",
                     f"0:{at.language}",
                     "--default-track",
-                    f"0:{at.is_original_lang}",
+                    f"0:{audio_default}",
                     "--visual-impaired-flag",
                     f"0:{at.descriptive}",
                     "--original-flag",
@@ -498,11 +565,14 @@ class Tracks:
             )
 
         if not skip_subtitles:
-            for st in self.subtitles:
+            for i, st in enumerate(self.subtitles):
                 if not st.path or not st.path.exists():
                     raise ValueError("Text Track must be downloaded before muxing...")
                 events.emit(events.Types.TRACK_MULTIPLEX, track=st)
-                default = bool(self.audio and is_close_match(st.language, [self.audio[0].language]) and st.forced)
+                if preferred_subtitle_idx is not None:
+                    default = i == preferred_subtitle_idx
+                else:
+                    default = bool(self.audio and is_close_match(st.language, [self.audio[0].language]) and st.forced)
                 cl.extend(
                     [
                         "--track-name",

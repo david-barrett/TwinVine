@@ -49,22 +49,23 @@ def main(version: bool, debug: bool) -> None:
     traceback.install(console=console, width=80, suppress=[click])
 
     console.print(
-    Padding(
-        Group(
-            Text(
-            r"░█▀▀░█▀█░█░█░▀█▀░█▀▀░█▀▄" + "\n"
-            r"░█▀▀░█░█░▀▄▀░░█░░█▀▀░█░█" + "\n"
-            r"░▀▀▀░▀░▀░░▀░░▀▀▀░▀▀▀░▀▀░" + "\n" ,
-                style="ascii.art",
+        Padding(
+            Group(
+                Text(
+                r"░█▀▀░█▀█░█░█░▀█▀░█▀▀░█▀▄" + "\n"
+                r"░█▀▀░█░█░▀▄▀░░█░░█▀▀░█░█" + "\n"
+                r"░▀▀▀░▀░▀░░▀░░▀▀▀░▀▀▀░▀▀░" + "\n" ,
+                    style="ascii.art",
+                ),
+                Text("    and more than unshackled...", style = "ascii.art"),
+                f"\nv [repr.number]{__version__}[/] - https://github.com/vinefeeder/envied",
             ),
-            Text("    and more than unshackled...", style = "ascii.art"),
-            f"\nv [repr.number]{__version__}[/] - https://github.com/vinefeeder/envied",
+            (1, 11, 1, 10),
+            expand=True,
         ),
-        (1, 11, 1, 10),
-        expand=True,
-    ),
-    justify="center",
-    )
+        justify="center",
+        )
+
 
 
 @atexit.register

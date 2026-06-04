@@ -6,6 +6,7 @@ from aiohttp import web
 
 from envied.core import binaries
 from envied.core.api import cors_middleware, setup_routes, setup_swagger
+from envied.core.api.compression import compression_middleware
 from envied.core.config import config
 from envied.core.constants import context_settings
 
@@ -35,6 +36,12 @@ from envied.core.constants import context_settings
     default=False,
     help="Enable debug logging for API operations.",
 )
+@click.option(
+    "--remote-only",
+    is_flag=True,
+    default=False,
+    help="Only expose remote service session endpoints (health, services, search, session).",
+)
 def serve(
     host: str,
     port: int,
@@ -45,6 +52,7 @@ def serve(
     no_key: bool,
     debug_api: bool,
     debug: bool,
+    remote_only: bool,
 ) -> None:
     """
     Serve your Local Widevine and PlayReady Devices and REST API for Remote Access.
@@ -119,19 +127,64 @@ def serve(
             config.serve["playready_devices"] = []
         config.serve["playready_devices"].extend(list(config.directories.prds.glob("*.prd")))
 
+        @web.middleware
+        async def api_key_authentication(request: web.Request, handler) -> web.Response:
+            """Authenticate API requests using X-Secret-Key header."""
+            if request.path == "/api/health":
+                return await handler(request)
+            secret_key = request.headers.get("X-Secret-Key")
+            if not secret_key:
+                return web.json_response({"status": 401, "message": "Secret Key is Empty."}, status=401)
+            if secret_key not in request.app["config"]["users"]:
+                return web.json_response({"status": 401, "message": "Secret Key is Invalid."}, status=401)
+            return await handler(request)
+
+        remote_only = remote_only or config.serve.get("remote_only", False)
+        if remote_only:
+            api_only = True
+
+        global_services = config.serve.get("services")
+        if global_services:
+            log.info(f"Global service allowlist: {', '.join(global_services)}")
+        users = config.serve.get("users", {})
+        for user_key, user_cfg in users.items() if isinstance(users, dict) else []:
+            user_services = user_cfg.get("services") if isinstance(user_cfg, dict) else None
+            if user_services:
+                username = user_cfg.get("username", user_key[:8] + "...")
+                log.info(f"User '{username}' restricted to services: {', '.join(user_services)}")
+
         if api_only:
             log.info("Starting REST API server (pywidevine/pyplayready CDM disabled)")
             if no_key:
-                app = web.Application(middlewares=[cors_middleware])
+                app = web.Application(middlewares=[cors_middleware, compression_middleware])
                 app["config"] = {"users": {}}
             else:
-                app = web.Application(middlewares=[cors_middleware, pywidevine_serve.authentication])
+                app = web.Application(middlewares=[cors_middleware, api_key_authentication, compression_middleware])
                 app["config"] = {"users": {api_secret: {"devices": [], "username": "api_user"}}}
             app["debug_api"] = debug_api
-            setup_routes(app)
-            setup_swagger(app)
-            log.info(f"REST API endpoints available at http://{host}:{port}/api/")
-            log.info(f"Swagger UI available at http://{host}:{port}/api/docs/")
+
+            # Start session cleanup loop for remote-dl sessions
+            from envied.core.api.session_store import get_session_store
+
+            session_store = get_session_store()
+
+            async def start_session_cleanup(_app: web.Application) -> None:
+                await session_store.start_cleanup_loop()
+
+            async def stop_session_cleanup(_app: web.Application) -> None:
+                await session_store.cancel_all_bridges()
+                await session_store.stop_cleanup_loop()
+
+            app.on_startup.append(start_session_cleanup)
+            app.on_cleanup.append(stop_session_cleanup)
+
+            setup_routes(app, remote_only=remote_only)
+            if not remote_only:
+                setup_swagger(app)
+                log.info(f"REST API endpoints available at http://{host}:{port}/api/")
+                log.info(f"Swagger UI available at http://{host}:{port}/api/docs/")
+            else:
+                log.info(f"Remote service endpoints available at http://{host}:{port}/api/session/")
             log.info("(Press CTRL+C to quit)")
             web.run_app(app, host=host, port=port, print=None)
         else:
@@ -181,19 +234,38 @@ def serve(
 
                     if serve_playready_flag and request.path.startswith("/playready"):
                         from pyplayready import __version__ as pyplayready_version
-                        response.headers["Server"] = f"https://git.gay/ready-dl/pyplayready serve v{pyplayready_version}"
+
+                        response.headers["Server"] = (
+                            f"https://git.gay/ready-dl/pyplayready serve v{pyplayready_version}"
+                        )
 
                     return response
+
                 return serve_authentication
 
             if no_key:
-                app = web.Application(middlewares=[cors_middleware])
+                app = web.Application(middlewares=[cors_middleware, compression_middleware])
             else:
                 serve_auth = create_serve_authentication(serve_playready and bool(prd_devices))
-                app = web.Application(middlewares=[cors_middleware, serve_auth])
+                app = web.Application(middlewares=[cors_middleware, serve_auth, compression_middleware])
 
             app["config"] = serve_config
             app["debug_api"] = debug_api
+
+            # Start session cleanup loop for remote-dl sessions
+            from envied.core.api.session_store import get_session_store
+
+            session_store = get_session_store()
+
+            async def start_session_cleanup(_app: web.Application) -> None:
+                await session_store.start_cleanup_loop()
+
+            async def stop_session_cleanup(_app: web.Application) -> None:
+                await session_store.cancel_all_bridges()
+                await session_store.stop_cleanup_loop()
+
+            app.on_startup.append(start_session_cleanup)
+            app.on_cleanup.append(stop_session_cleanup)
 
             if serve_widevine:
                 app.on_startup.append(pywidevine_serve._startup)
@@ -226,6 +298,7 @@ def serve(
 
                 async def playready_ping(_: web.Request) -> web.Response:
                     from pyplayready import __version__ as pyplayready_version
+
                     response = web.json_response({"message": "OK"})
                     response.headers["Server"] = f"https://git.gay/ready-dl/pyplayready serve v{pyplayready_version}"
                     return response
@@ -237,13 +310,16 @@ def serve(
             elif serve_playready:
                 log.info("No PlayReady devices found, skipping PlayReady CDM endpoints")
 
-            setup_routes(app)
-            setup_swagger(app)
+            setup_routes(app, remote_only=remote_only)
 
             if serve_widevine:
                 log.info(f"Widevine CDM endpoints available at http://{host}:{port}/{{device}}/open")
-            log.info(f"REST API endpoints available at http://{host}:{port}/api/")
-            log.info(f"Swagger UI available at http://{host}:{port}/api/docs/")
+            if remote_only:
+                log.info(f"Remote service endpoints available at http://{host}:{port}/api/session/")
+            else:
+                setup_swagger(app)
+                log.info(f"REST API endpoints available at http://{host}:{port}/api/")
+                log.info(f"Swagger UI available at http://{host}:{port}/api/docs/")
             log.info("(Press CTRL+C to quit)")
             web.run_app(app, host=host, port=port, print=None)
     finally:

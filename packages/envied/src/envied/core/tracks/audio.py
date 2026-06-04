@@ -57,7 +57,7 @@ class Audio(Track):
         @staticmethod
         def from_netflix_profile(profile: str) -> Audio.Codec:
             profile = profile.lower().strip()
-            if profile.startswith("heaac"):
+            if profile.startswith("heaac") or profile.startswith("xheaac"):
                 return Audio.Codec.AAC
             if profile.startswith("dd-"):
                 return Audio.Codec.AC3
@@ -125,6 +125,31 @@ class Audio(Track):
 
         self.joc = joc
         self.descriptive = bool(descriptive)
+
+    def to_dict(self) -> dict[str, Any]:
+        data = super().to_dict()
+        data.update(
+            {
+                "codec": self.codec.name if self.codec else None,
+                "bitrate": self.bitrate,
+                "channels": self.channels,
+                "joc": self.joc,
+                "descriptive": self.descriptive,
+            }
+        )
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Audio:
+        kwargs = Track.base_kwargs_from_dict(data)
+        return cls(
+            **kwargs,
+            codec=Audio.Codec[data["codec"]] if data.get("codec") else None,
+            bitrate=data.get("bitrate"),
+            channels=data.get("channels"),
+            joc=data.get("joc"),
+            descriptive=data.get("descriptive", False),
+        )
 
     @property
     def atmos(self) -> bool:

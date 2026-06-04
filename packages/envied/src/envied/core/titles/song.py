@@ -1,3 +1,4 @@
+import re
 from abc import ABC
 from typing import Any, Iterable, Optional, Union
 
@@ -94,6 +95,15 @@ class Song(Title):
 
     def get_filename(self, media_info: MediaInfo, folder: bool = False, show_service: bool = True) -> str:
         if folder:
+            template = config.get_folder_template("songs")
+            if template:
+                formatter = TemplateFormatter(template)
+                context = self._build_template_context(media_info, show_service)
+                folder_name = formatter.format(context)
+
+                separators = re.sub(r"\{[^}]*\}", "", template)
+                spacer = "." if "." in separators and " " not in separators else " "
+                return sanitize_filename(folder_name, spacer)
             name = f"{self.artist} - {self.album}"
             if self.year:
                 name += f" ({self.year})"

@@ -5,6 +5,7 @@ import html
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -17,8 +18,6 @@ from zlib import crc32
 
 import m3u8
 import requests
-from curl_cffi.requests import Response as CurlResponse
-from curl_cffi.requests import Session as CurlSession
 from langcodes import Language, tag_is_valid
 from m3u8 import M3U8
 from pyplayready.cdm import Cdm as PlayReadyCdm
@@ -30,15 +29,23 @@ from requests import Session
 from envied.core import binaries
 from envied.core.cdm.detect import is_playready_cdm, is_widevine_cdm
 from envied.core.constants import DOWNLOAD_CANCELLED, DOWNLOAD_LICENCE_ONLY, AnyTrack
-from envied.core.downloaders import requests as requests_downloader
 from envied.core.drm import DRM_T, ClearKey, MonaLisa, PlayReady, Widevine
 from envied.core.events import events
+from envied.core.session import RnetResponse, RnetSession
 from envied.core.tracks import Audio, Subtitle, Tracks, Video
 from envied.core.utilities import get_debug_logger, get_extension, is_close_match, try_ensure_utf8
 
 
 class HLS:
-    def __init__(self, manifest: M3U8, session: Optional[Union[Session, CurlSession]] = None):
+    SUPP_CODECS_RE = re.compile(r'SUPPLEMENTAL-CODECS="([^"]+)"', re.IGNORECASE)
+
+    def __init__(
+        self,
+        manifest: M3U8,
+        session: Optional[Union[Session, RnetSession]] = None,
+        url: Optional[str] = None,
+        raw_text: Optional[str] = None,
+    ):
         if not manifest:
             raise ValueError("HLS manifest must be provided.")
         if not isinstance(manifest, M3U8):
@@ -48,9 +55,11 @@ class HLS:
 
         self.manifest = manifest
         self.session = session or Session()
+        self.url = url
+        self.raw_text = raw_text
 
     @classmethod
-    def from_url(cls, url: str, session: Optional[Union[Session, CurlSession]] = None, **args: Any) -> HLS:
+    def from_url(cls, url: str, session: Optional[Union[Session, RnetSession]] = None, **args: Any) -> HLS:
         if not url:
             raise requests.URLRequired("HLS manifest URL must be provided.")
         if not isinstance(url, str):
@@ -58,26 +67,26 @@ class HLS:
 
         if not session:
             session = Session()
-        elif not isinstance(session, (Session, CurlSession)):
-            raise TypeError(f"Expected session to be a {Session} or {CurlSession}, not {session!r}")
+        elif not isinstance(session, (Session, RnetSession)):
+            raise TypeError(f"Expected session to be a {Session} or {RnetSession}, not {session!r}")
 
         res = session.get(url, **args)
 
-        # Handle requests and curl_cffi response objects
+        # Handle requests and rnet response objects
         if isinstance(res, requests.Response):
             if not res.ok:
                 raise requests.ConnectionError("Failed to request the M3U(8) document.", response=res)
             content = res.text
-        elif isinstance(res, CurlResponse):
+        elif isinstance(res, RnetResponse):
             if not res.ok:
                 raise requests.ConnectionError("Failed to request the M3U(8) document.", response=res)
             content = res.text
         else:
-            raise TypeError(f"Expected response to be a requests.Response or curl_cffi.Response, not {type(res)}")
+            raise TypeError(f"Expected response to be a requests.Response or rnet.Response, not {type(res)}")
 
         master = m3u8.loads(content, uri=url)
 
-        return cls(master, session)
+        return cls(master, session, url=url, raw_text=content)
 
     @classmethod
     def from_text(cls, text: str, url: str) -> HLS:
@@ -93,7 +102,31 @@ class HLS:
 
         master = m3u8.loads(text, uri=url)
 
-        return cls(master)
+        return cls(master, raw_text=text)
+
+    def supplemental_codecs_by_uri(self) -> dict[str, str]:
+        """Map each variant URI to its SUPPLEMENTAL-CODECS value.
+
+        python-m3u8 drops this attribute, so we re-parse the raw text to recover it for
+        Dolby Vision composite detection (dvh1.08.x advertised only in SUPPLEMENTAL-CODECS
+        while primary CODECS stays plain hvc1).
+        """
+        if not self.raw_text:
+            return {}
+        out: dict[str, str] = {}
+        lines = self.raw_text.splitlines()
+        for i, line in enumerate(lines):
+            if not line.startswith("#EXT-X-STREAM-INF"):
+                continue
+            supp_match = self.SUPP_CODECS_RE.search(line)
+            if not supp_match:
+                continue
+            for j in range(i + 1, len(lines)):
+                uri = lines[j].strip()
+                if uri and not uri.startswith("#"):
+                    out[uri] = supp_match.group(1)
+                    break
+        return out
 
     def to_tracks(self, language: Union[str, Language]) -> Tracks:
         """
@@ -115,13 +148,18 @@ class HLS:
         cc_by_group_id: dict[str, list[dict[str, Any]]] = {}
         for media in self.manifest.media:
             if media.type == "CLOSED-CAPTIONS":
-                cc_by_group_id.setdefault(media.group_id, []).append({
-                    "language": media.language,
-                    "name": media.name,
-                    "instream_id": media.instream_id,
-                    "characteristics": media.characteristics,
-                })
+                cc_by_group_id.setdefault(media.group_id, []).append(
+                    {
+                        "language": media.language,
+                        "name": media.name,
+                        "instream_id": media.instream_id,
+                        "characteristics": media.characteristics,
+                    }
+                )
         tracks = Tracks()
+
+        supplemental_codecs = self.supplemental_codecs_by_uri()
+        dv_supp_prefixes = ("dva1", "dvav", "dvhe", "dvh1")
 
         for playlist in self.manifest.playlists:
             audio_group = playlist.stream_info.audio
@@ -143,6 +181,26 @@ class HLS:
             else:
                 primary_track_type = Video
 
+            primary_codecs = (playlist.stream_info.codecs or "").lower()
+            primary_has_dv = any(codec.split(".")[0] in dv_supp_prefixes for codec in primary_codecs.split(","))
+
+            supp_codecs_str = supplemental_codecs.get(playlist.uri, "")
+            supp_dv_codec: Optional[str] = None
+            for codec in supp_codecs_str.lower().split(","):
+                token = codec.strip().split("/")[0]
+                if token.split(".")[0] in dv_supp_prefixes:
+                    supp_dv_codec = token
+                    break
+
+            video_range = (
+                Video.Range.DV if primary_has_dv else Video.Range.from_m3u_range_tag(playlist.stream_info.video_range)
+            )
+            # DV-composite track: primary codec is plain HEVC but SUPPLEMENTAL-CODECS advertises
+            # a DV codec. Range stays whatever VIDEO-RANGE signaled (HDR10/HLG/SDR); DVFixup will
+            # restore DV signaling post-download. Services that know their encoder embeds HDR10+
+            # SEI must override `range` themselves (see services/ATV).
+            dv_compatible_bitstream = primary_track_type is Video and not primary_has_dv and supp_dv_codec is not None
+
             tracks.add(
                 primary_track_type(
                     id_=hex(crc32(str(playlist).encode()))[2:],
@@ -161,18 +219,14 @@ class HLS:
                     # video track args
                     **(
                         dict(
-                            range_=Video.Range.DV
-                            if any(
-                                codec.split(".")[0] in ("dva1", "dvav", "dvhe", "dvh1")
-                                for codec in (playlist.stream_info.codecs or "").lower().split(",")
-                            )
-                            else Video.Range.from_m3u_range_tag(playlist.stream_info.video_range),
+                            range_=video_range,
                             width=playlist.stream_info.resolution[0] if playlist.stream_info.resolution else None,
                             height=playlist.stream_info.resolution[1] if playlist.stream_info.resolution else None,
                             fps=playlist.stream_info.frame_rate,
                             closed_captions=cc_by_group_id.get(
                                 (playlist.stream_info.closed_captions or "").strip('"'), []
                             ),
+                            dv_compatible_bitstream=dv_compatible_bitstream,
                         )
                         if primary_track_type is Video
                         else {}
@@ -241,40 +295,200 @@ class HLS:
                 )
             )
 
+        for video in tracks.videos:
+            has_resolution = video.width and video.height
+            has_codec = video.codec is not None
+            if has_resolution and has_codec:
+                continue
+            try:
+                probe = HLS._probe_ts_info(video.url, self.session)
+                if probe:
+                    width, height, codec = probe
+                    if not has_resolution:
+                        video.width, video.height = width, height
+                    if not has_codec:
+                        video.codec = codec
+            except Exception:
+                pass
+
+        if self.url:
+            tracks.manifest_url = self.url
         return tracks
 
     @staticmethod
-    def _finalize_n_m3u8dl_re_output(*, track: AnyTrack, save_dir: Path, save_path: Path) -> Path:
-        """
-        Finalize output from N_m3u8DL-RE.
+    def _probe_ts_info(
+        variant_url: str, session: Optional[Union[Session, RnetSession]] = None
+    ) -> Optional[tuple[int, int, Video.Codec]]:
+        """Probe the first TS segment of a variant playlist to extract resolution and codec."""
+        if not session:
+            session = Session()
 
-        We call N_m3u8DL-RE with `--save-name track.id`, so the final file should be `{track.id}.*` under `save_dir`.
-        This moves that output to `save_path` (preserving the real suffix) and, for subtitles, updates `track.codec`
-        to match the produced file extension.
-        """
-        matches = [p for p in save_dir.rglob(f"{track.id}.*") if p.is_file()]
-        if not matches:
-            raise FileNotFoundError(f"No output files produced by N_m3u8DL-RE for save-name={track.id} in: {save_dir}")
+        res = session.get(variant_url)
+        variant = m3u8.loads(res.text if hasattr(res, "text") else res.text, uri=variant_url)
+        if not variant.segments:
+            return None
 
-        primary = max(matches, key=lambda p: p.stat().st_size)
+        seg_uri = urljoin(variant_url, variant.segments[0].uri)
 
-        final_save_path = save_path.with_suffix(primary.suffix) if primary.suffix else save_path
+        # Download only the first 8KB — SPS is always near the start of the first TS packet
+        res = session.get(seg_uri, headers={"Range": "bytes=0-8191"})
+        data = res.content
 
-        final_save_path.parent.mkdir(parents=True, exist_ok=True)
-        if primary.absolute() != final_save_path.absolute():
-            final_save_path.unlink(missing_ok=True)
-            shutil.move(str(primary), str(final_save_path))
+        return HLS._parse_ts_video_info(data)
 
-        if isinstance(track, Subtitle):
-            ext = final_save_path.suffix.lower().lstrip(".")
-            try:
-                track.codec = Subtitle.Codec.from_mime(ext)
-            except ValueError:
-                pass
+    @staticmethod
+    def _parse_ts_video_info(data: bytes) -> Optional[tuple[int, int, Video.Codec]]:
+        """Parse H.264/H.265 NAL units from TS segment data to extract resolution and codec."""
 
-        shutil.rmtree(save_dir, ignore_errors=True)
+        class _BitReader:
+            def __init__(self, buf: bytes) -> None:
+                self.data = buf
+                self.pos = 0
 
-        return final_save_path
+            def bits(self, n: int) -> int:
+                val = 0
+                for _ in range(n):
+                    val = (val << 1) | ((self.data[self.pos >> 3] >> (7 - (self.pos & 7))) & 1)
+                    self.pos += 1
+                return val
+
+            def ue(self) -> int:
+                zeros = 0
+                while self.bits(1) == 0:
+                    zeros += 1
+                return (1 << zeros) - 1 + self.bits(zeros) if zeros else 0
+
+            def se(self) -> int:
+                val = self.ue()
+                return (val + 1) // 2 if val & 1 else -(val // 2)
+
+        # Find SPS NAL unit via start code
+        # H.264: NAL type 7 (SPS), identified by byte & 0x1F == 7
+        # H.265: NAL type 33 (SPS), identified by (byte >> 1) & 0x3F == 33
+        for i in range(len(data) - 4):
+            start3 = data[i : i + 3] == b"\x00\x00\x01"
+            start4 = data[i : i + 4] == b"\x00\x00\x00\x01"
+            if not start3 and not start4:
+                continue
+            offset = i + (4 if start4 else 3)
+            if offset >= len(data):
+                continue
+
+            nal_byte = data[offset]
+            h264_type = nal_byte & 0x1F
+            h265_type = (nal_byte >> 1) & 0x3F
+
+            # H.264 SPS (NAL type 7)
+            if h264_type == 7:
+                sps = data[offset : offset + 64]
+                if len(sps) < 5:
+                    continue
+                try:
+                    r = _BitReader(sps[1:])  # skip NAL header byte
+                    profile = r.bits(8)
+                    r.bits(8)  # constraint flags
+                    r.bits(8)  # level
+                    r.ue()  # sps_id
+
+                    if profile in (100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134):
+                        chroma = r.ue()
+                        if chroma == 3:
+                            r.bits(1)
+                        r.ue()  # bit_depth_luma
+                        r.ue()  # bit_depth_chroma
+                        r.bits(1)  # qpprime_y_zero_transform_bypass
+                        if r.bits(1):  # scaling_matrix_present
+                            for j in range(6 if chroma != 3 else 12):
+                                if r.bits(1):
+                                    last = 8
+                                    for _ in range(16 if j < 6 else 64):
+                                        if last != 0:
+                                            last = (last + r.se()) & 0xFF
+
+                    r.ue()  # log2_max_frame_num
+                    poc_type = r.ue()
+                    if poc_type == 0:
+                        r.ue()
+                    elif poc_type == 1:
+                        r.bits(1)
+                        r.se()
+                        r.se()
+                        for _ in range(r.ue()):
+                            r.se()
+
+                    r.ue()  # max_num_ref_frames
+                    r.bits(1)  # gaps_in_frame_num
+
+                    w_mbs = r.ue() + 1
+                    h_map = r.ue() + 1
+                    frame_mbs_only = r.bits(1)
+                    if not frame_mbs_only:
+                        r.bits(1)
+                    r.bits(1)  # direct_8x8_inference
+
+                    cl = cr = ct = cb = 0
+                    if r.bits(1):  # crop
+                        cl, cr, ct, cb = r.ue(), r.ue(), r.ue(), r.ue()
+
+                    width = w_mbs * 16 - (cl + cr) * 2
+                    height = (2 - frame_mbs_only) * h_map * 16 - (ct + cb) * 2
+                    return (width, height, Video.Codec.AVC)
+                except (IndexError, ValueError):
+                    continue
+
+            # H.265 SPS (NAL type 33)
+            elif h265_type == 33:
+                sps = data[offset : offset + 128]
+                if len(sps) < 10:
+                    continue
+                try:
+                    r = _BitReader(sps[2:])  # skip 2-byte NAL header
+                    r.bits(4)  # sps_video_parameter_set_id
+                    max_sub_layers = r.bits(3)
+                    r.bits(1)  # sps_temporal_id_nesting
+
+                    # profile_tier_level
+                    r.bits(2)  # general_profile_space
+                    r.bits(1)  # general_tier
+                    r.bits(5)  # general_profile_idc
+                    r.bits(32)  # general_profile_compatibility_flags
+                    r.bits(48)  # general_constraint_indicator_flags
+                    r.bits(8)  # general_level_idc
+                    sub_layer_flags = []
+                    for _ in range(max_sub_layers - 1):
+                        sub_layer_flags.append((r.bits(1), r.bits(1)))
+                    if max_sub_layers - 1 > 0:
+                        for _ in range(8 - (max_sub_layers - 1)):
+                            r.bits(2)
+                    for profile_present, level_present in sub_layer_flags:
+                        if profile_present:
+                            r.bits(2 + 1 + 5 + 32 + 48 + 8)
+                        if level_present:
+                            r.bits(8)
+
+                    r.ue()  # sps_seq_parameter_set_id
+                    chroma = r.ue()
+                    if chroma == 3:
+                        r.bits(1)
+
+                    width = r.ue()
+                    height = r.ue()
+
+                    if r.bits(1):  # conformance_window
+                        cl = r.ue()
+                        cr = r.ue()
+                        ct = r.ue()
+                        cb = r.ue()
+                        sub_w = 2 if chroma in (1, 2) else 1
+                        sub_h = 2 if chroma == 1 else 1
+                        width -= (cl + cr) * sub_w
+                        height -= (ct + cb) * sub_h
+
+                    return (width, height, Video.Codec.HEVC)
+                except (IndexError, ValueError):
+                    continue
+
+        return None
 
     @staticmethod
     def download_track(
@@ -282,7 +496,7 @@ class HLS:
         save_path: Path,
         save_dir: Path,
         progress: partial,
-        session: Optional[Union[Session, CurlSession]] = None,
+        session: Optional[Union[Session, RnetSession]] = None,
         proxy: Optional[str] = None,
         max_workers: Optional[int] = None,
         license_widevine: Optional[Callable] = None,
@@ -291,8 +505,8 @@ class HLS:
     ) -> None:
         if not session:
             session = Session()
-        elif not isinstance(session, (Session, CurlSession)):
-            raise TypeError(f"Expected session to be a {Session} or {CurlSession}, not {session!r}")
+        elif not isinstance(session, (Session, RnetSession)):
+            raise TypeError(f"Expected session to be a {Session} or {RnetSession}, not {session!r}")
 
         if proxy:
             # Handle proxies differently based on session type
@@ -306,15 +520,13 @@ class HLS:
         else:
             # Get the playlist text and handle both session types
             response = session.get(track.url)
-            if isinstance(response, requests.Response) or isinstance(response, CurlResponse):
+            if isinstance(response, requests.Response) or isinstance(response, RnetResponse):
                 if not response.ok:
                     log.error(f"Failed to request the invariant M3U8 playlist: {response.status_code}")
                     sys.exit(1)
                 playlist_text = response.text
             else:
-                raise TypeError(
-                    f"Expected response to be a requests.Response or curl_cffi.Response, not {type(response)}"
-                )
+                raise TypeError(f"Expected response to be a requests.Response or rnet.Response, not {type(response)}")
 
             master = m3u8.loads(playlist_text, uri=track.url)
 
@@ -339,6 +551,12 @@ class HLS:
                 media_drm = HLS.get_drm(media_playlist_key, session)
                 if isinstance(media_drm, (Widevine, PlayReady)):
                     track_kid = HLS.get_track_kid_from_init(master, track, session) or media_drm.kid
+                    # Preserve pre-existing keys (e.g. from server_cdm)
+                    if track.drm:
+                        for existing_drm in track.drm:
+                            if hasattr(existing_drm, "content_keys") and existing_drm.content_keys:
+                                media_drm.content_keys.update(existing_drm.content_keys)
+                    track.drm = [media_drm]
                     try:
                         if not license_widevine:
                             raise ValueError("license_widevine func must be supplied to use DRM")
@@ -347,7 +565,6 @@ class HLS:
                         progress(downloaded="[yellow]LICENSED")
                         initial_drm_licensed = True
                         initial_drm_key = media_playlist_key
-                        track.drm = [media_drm]
                         session_drm = media_drm
                     except Exception:  # noqa
                         DOWNLOAD_CANCELLED.set()  # skip pending track downloads
@@ -359,8 +576,9 @@ class HLS:
             try:
                 if not license_widevine:
                     raise ValueError("license_widevine func must be supplied to use DRM")
+                track_kid = HLS.get_track_kid_from_init(master, track, session) or session_drm.kid
                 progress(downloaded="LICENSING")
-                license_widevine(session_drm)
+                license_widevine(session_drm, track_kid=track_kid)
                 progress(downloaded="[yellow]LICENSED")
             except Exception:  # noqa
                 DOWNLOAD_CANCELLED.set()  # skip pending track downloads
@@ -391,9 +609,6 @@ class HLS:
         progress(total=total_segments)
 
         downloader = track.downloader
-        if downloader.__name__ == "aria2c" and any(x.byterange for x in master.segments if x not in unwanted_segments):
-            downloader = requests_downloader
-            log.warning("Falling back to the requests downloader as aria2(c) doesn't support the Range header")
 
         urls: list[dict[str, Any]] = []
         segment_durations: list[int] = []
@@ -422,7 +637,6 @@ class HLS:
 
         segment_save_dir = save_dir / "segments"
 
-        skip_merge = False
         downloader_args = dict(
             urls=urls,
             output_dir=segment_save_dir,
@@ -431,21 +645,8 @@ class HLS:
             cookies=session.cookies,
             proxy=proxy,
             max_workers=max_workers,
+            session=session,
         )
-
-        if downloader.__name__ == "n_m3u8dl_re":
-            skip_merge = True
-            # session_drm already has correct content_keys from initial licensing above
-            n_m3u8dl_content_keys = session_drm.content_keys if session_drm else None
-
-            downloader_args.update(
-                {
-                    "output_dir": save_dir,
-                    "filename": track.id,
-                    "track": track,
-                    "content_keys": n_m3u8dl_content_keys,
-                }
-            )
 
         debug_logger = get_debug_logger()
         if debug_logger:
@@ -457,10 +658,8 @@ class HLS:
                     "track_id": getattr(track, "id", None),
                     "track_type": track.__class__.__name__,
                     "total_segments": total_segments,
-                    "downloader": downloader.__name__,
                     "has_drm": bool(session_drm),
                     "drm_type": session_drm.__class__.__name__ if session_drm else None,
-                    "skip_merge": skip_merge,
                     "save_path": str(save_path),
                 },
             )
@@ -475,16 +674,8 @@ class HLS:
                     status_update["downloaded"] = f"HLS {downloaded}"
                 progress(**status_update)
 
-        # see https://github.com/devine-dl/devine/issues/71
-        for control_file in segment_save_dir.glob("*.aria2__temp"):
-            control_file.unlink()
-
-        if skip_merge:
-            final_save_path = HLS._finalize_n_m3u8dl_re_output(track=track, save_dir=save_dir, save_path=save_path)
-            progress(downloaded="Downloaded")
-            track.path = final_save_path
-            events.emit(events.Types.TRACK_DOWNLOADED, track=track)
-            return
+        for control_file in segment_save_dir.glob("*.!dev"):
+            control_file.unlink(missing_ok=True)
 
         progress(total=total_segments, completed=0, downloaded="Merging")
 
@@ -644,13 +835,11 @@ class HLS:
                     )
 
                     # Check response based on session type
-                    if isinstance(res, requests.Response) or isinstance(res, CurlResponse):
+                    if isinstance(res, requests.Response) or isinstance(res, RnetResponse):
                         res.raise_for_status()
                         init_content = res.content
                     else:
-                        raise TypeError(
-                            f"Expected response to be requests.Response or curl_cffi.Response, not {type(res)}"
-                        )
+                        raise TypeError(f"Expected response to be requests.Response or rnet.Response, not {type(res)}")
 
                     map_data = (segment.init_section, init_content)
 
@@ -687,6 +876,14 @@ class HLS:
                             DOWNLOAD_CANCELLED.set()  # skip pending track downloads
                             progress(downloaded="[red]FAILED")
                             raise
+                    if (
+                        encryption_data
+                        and isinstance(drm, (Widevine, PlayReady))
+                        and isinstance(encryption_data[1], type(drm))
+                        and getattr(encryption_data[1], "content_keys", None)
+                    ):
+                        for prev_kid, prev_key in encryption_data[1].content_keys.items():
+                            drm.content_keys.setdefault(prev_kid, prev_key)
                     encryption_data = (key, drm)
 
             if DOWNLOAD_LICENCE_ONLY.is_set():
@@ -736,8 +933,7 @@ class HLS:
                     "save_dir_exists": save_dir.exists(),
                     "segments_found": len(segments_to_merge),
                     "segment_files": [f.name for f in segments_to_merge[:10]],  # Limit to first 10
-                    "downloader": downloader.__name__,
-                    "skip_merge": skip_merge,
+                    "downloader": "requests",
                 },
             )
 
@@ -755,8 +951,7 @@ class HLS:
                         "save_dir": str(save_dir),
                         "save_dir_exists": save_dir.exists(),
                         "directory_contents": [str(p) for p in all_contents],
-                        "downloader": downloader.__name__,
-                        "skip_merge": skip_merge,
+                        "downloader": "requests",
                     },
                 )
             raise FileNotFoundError(error_msg)
@@ -787,6 +982,10 @@ class HLS:
         progress(downloaded="Downloaded")
 
         track.path = save_path
+
+        if session_drm:
+            track.drm = None
+
         events.emit(events.Types.TRACK_DOWNLOADED, track=track)
 
     @staticmethod
@@ -865,7 +1064,7 @@ class HLS:
 
     @staticmethod
     def parse_session_data_keys(
-        manifest: M3U8, session: Optional[Union[Session, CurlSession]] = None
+        manifest: M3U8, session: Optional[Union[Session, RnetSession]] = None
     ) -> list[m3u8.model.Key]:
         """Parse `com.apple.hls.keys` session data and return Key objects."""
         keys: list[m3u8.model.Key] = []
@@ -940,7 +1139,7 @@ class HLS:
     def get_track_kid_from_init(
         master: M3U8,
         track: AnyTrack,
-        session: Union[Session, CurlSession],
+        session: Union[Session, RnetSession],
     ) -> Optional[UUID]:
         """
         Extract the track's Key ID from its init segment (EXT-X-MAP).
@@ -1007,7 +1206,7 @@ class HLS:
     @staticmethod
     def get_drm(
         key: Union[m3u8.model.SessionKey, m3u8.model.Key],
-        session: Optional[Union[Session, CurlSession]] = None,
+        session: Optional[Union[Session, RnetSession]] = None,
     ) -> DRM_T:
         """
         Convert HLS EXT-X-KEY data to an initialized DRM object.
@@ -1019,8 +1218,8 @@ class HLS:
 
         Raises a NotImplementedError if the key system is not supported.
         """
-        if not isinstance(session, (Session, CurlSession, type(None))):
-            raise TypeError(f"Expected session to be a {Session} or {CurlSession}, not {type(session)}")
+        if not isinstance(session, (Session, RnetSession, type(None))):
+            raise TypeError(f"Expected session to be a {Session} or {RnetSession}, not {type(session)}")
         if not session:
             session = Session()
 

@@ -1,6 +1,8 @@
-
 headers:
-  User-Agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+  x-device-type: "androidtv"
+  x-app-store-type: "androidtv"
+  x-client-id: "tvnz-tvnz-androidtv"
+  user-agent: "Dalvik/2.1.0 (Linux; U; Android 11; Android TV Build/RTMA.250416.082)"
 
 endpoints:
   authorize: "https://watch-cdn.edge-api.tvnz.co.nz/media/content/authorize"
