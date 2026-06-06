@@ -16,7 +16,7 @@ from envied.core.console import console
 from envied.core.constants import AnyTrack
 from envied.core.credential import Credential
 from envied.core.tracks import Chapters, Tracks, Subtitle, Chapter
-from envied.core.utilities import get_ip_info
+#from envied.core.utilities import get_ip_info
 from envied.core.manifests import HLS, DASH
 
 from bs4 import BeautifulSoup
