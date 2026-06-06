@@ -182,7 +182,7 @@ class PlexLoader(BaseLoader):
                 )
             return None
 
-        else:
+        else:  # series - fetch episodes
             try:
                 headers = {
                     "referer": "https://www.plex.tv",
