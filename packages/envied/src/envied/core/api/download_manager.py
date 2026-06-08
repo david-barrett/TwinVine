@@ -606,11 +606,11 @@ class DownloadQueueManager:
             "parameters": job.parameters,
         }
 
-        payload_fd, payload_path = tempfile.mkstemp(prefix=f"unshackle_job_{job.job_id}_", suffix="_payload.json")
+        payload_fd, payload_path = tempfile.mkstemp(prefix=f"envied.job_{job.job_id}_", suffix="_payload.json")
         os.close(payload_fd)
-        result_fd, result_path = tempfile.mkstemp(prefix=f"unshackle_job_{job.job_id}_", suffix="_result.json")
+        result_fd, result_path = tempfile.mkstemp(prefix=f"envied.job_{job.job_id}_", suffix="_result.json")
         os.close(result_fd)
-        progress_fd, progress_path = tempfile.mkstemp(prefix=f"unshackle_job_{job.job_id}_", suffix="_progress.json")
+        progress_fd, progress_path = tempfile.mkstemp(prefix=f"envied.job_{job.job_id}_", suffix="_progress.json")
         os.close(progress_fd)
 
         with open(payload_path, "w", encoding="utf-8") as handle:
@@ -741,7 +741,7 @@ def get_download_manager() -> DownloadQueueManager:
     """Get the global download manager instance."""
     global download_manager
     if download_manager is None:
-        # Load configuration from unshackle config
+        # Load configuration from envied.config
         from envied.core.config import config
 
         max_concurrent = getattr(config, "max_concurrent_downloads", 2)

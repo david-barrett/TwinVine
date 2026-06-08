@@ -2,7 +2,7 @@
 API Error Handling System
 
 Provides structured error responses with error codes, categorization,
-and optional debug information for the unshackle REST API.
+and optional debug information for the envied.REST API.
 """
 
 from __future__ import annotations

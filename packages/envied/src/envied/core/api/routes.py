@@ -1328,9 +1328,9 @@ def setup_swagger(app: web.Application) -> None:
         app,
         swagger_ui_settings=SwaggerUiSettings(path="/api/docs/"),
         info=SwaggerInfo(
-            title="Unshackle REST API",
+            title="envied.REST API",
             version=__version__,
-            description="REST API for Unshackle - Modular Movie, TV, and Music Archival Software",
+            description="REST API for envied.- Modular Movie, TV, and Music Archival Software",
         ),
     )
 

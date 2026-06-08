@@ -32,7 +32,7 @@ from envied.core.config import config
 from envied.core.constants import LANGUAGE_EXACT_DISTANCE, LANGUAGE_MAX_DISTANCE
 
 """
-Utility functions for the unshackle media archival tool.
+Utility functions for the envied.media archival tool.
 
 This module provides various utility functions including:
 - Font discovery and fallback system for subtitle rendering
@@ -784,7 +784,7 @@ class DebugLogger:
             operation="session_start",
             message="Debug logging session started",
             context={
-                "unshackle_version": __version__,
+                "envied.version": __version__,
                 "python_version": sys.version,
                 "platform": platform.platform(),
                 "platform_system": platform.system(),
