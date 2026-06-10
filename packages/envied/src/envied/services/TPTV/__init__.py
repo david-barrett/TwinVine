@@ -330,3 +330,8 @@ class TPTV(Service):
         elif 'product' in url:  # single item
             prod_id = url.split('-')[-1] 
             return [prod_id]
+        elif 'VIDEO' in url:
+            prod_id = url.split('/')[-2]
+            return [prod_id]
+        else:
+            raise ValueError("URL format not recognized for data retrieval.")

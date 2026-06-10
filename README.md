@@ -171,7 +171,7 @@ ARD   CBC   CTV  DSNP  ITV  MTSP  NBLA  NRK  PLUTO  RTE   STV   TUBI  UKTV  ZDF
 These services have web-origins and not all have been tested by me.  
 
 **Servies Note**
-Some services may be found in an options folder (packages/envied/src/envied/options/).  The may have constraints on the python version they run under. Only copy a service into the packages/envied/src/envied/services folder if the version matches yours.
+Some services may be found in an options folder (packages/envied/src/envied/options/).  The may have constraints on the python version they run under. Only copy a  service into the packages/envied/src/envied/services folder if the version matches yours.
   
 **Other README's""
     TwinVine/packages/vinefeeder/src/vinefeeder/README.md  
