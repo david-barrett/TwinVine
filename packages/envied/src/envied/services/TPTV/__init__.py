@@ -314,8 +314,8 @@ class TPTV(Service):
 
     def get_data(self, url: str) -> dict:
         self.session.headers.update({'tenant': 'encore'})
-        if 'collection' in url:
-            prod_id = url.split('/')[-1]
+        if 'details' in url:
+            prod_id = url.split('item/')[-2]
             url = f"https://prod.suggestedtv.com/api/client/v1/collection/by-reference/{prod_id}?extend=label"
             r = self.session.get(url)
             if r.status_code != 200:
@@ -327,8 +327,8 @@ class TPTV(Service):
             for child in children:
                 product_links.append(child['id']) if 'product' in child.get('classification') else None
             return product_links
-        elif 'product' in url:  # single item
-            prod_id = url.split('-')[-1] 
+        elif 'playback' in url:  # single item
+            prod_id = url.split('/')[-1] 
             return [prod_id]
         elif 'VIDEO' in url:
             prod_id = url.split('/')[-2]
