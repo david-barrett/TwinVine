@@ -54,7 +54,7 @@ class RKTN(Service):
     """
 
     ALIASES = ["RakutenTV", "rakuten", "rakutentv"]
-    TITLE_RE = r"^(?:https?://(?:www\.)?rakuten\.tv/([a-z]+/|)movies(?:/[a-z]{2})?/)(?P<id>[a-z0-9-]+)"
+    TITLE_RE = r"rakuten\.tv/(?:[a-z]+/)?(?:player/)?movies/(?:[a-z]+/)?(?P<id>[a-z0-9-]+)"
     LANG_MAP = {
         "es": "es-ES",
         "pt": "pt-PT",
@@ -90,8 +90,8 @@ class RKTN(Service):
 
     def __init__(self, ctx, title, device, movie, desired_audio_language):
         super().__init__(ctx)
-        #self.parse_title(ctx, title)
-        self.title = title
+        m = re.search(self.TITLE_RE, title)
+        self.title = m.group("id") if m else title
         self.cdm = ctx.obj.cdm
         self.playready = isinstance(self.cdm, PlayReadyCdm)
         self.desired_audio_language = desired_audio_language
@@ -99,6 +99,7 @@ class RKTN(Service):
         self.vcodec = ctx.parent.params.get("vcodec") or Video.Codec.AVC # Defaults to H264
         self.resolution = "UHD" if (self.vcodec.extension.lower() == "h265" or self.range in ['HYBRID', 'HDR10', 'HDR10P', 'DV']) else "FHD"
         self.device = "lgui40" if self.playready else "android"
+        self.stream_device = "lgui40" if self.playready else "web"
         self.movie = movie or "movies" in title
         self.audio_languages = []
         
@@ -239,9 +240,12 @@ class RKTN(Service):
             stream_info = stream_info["data"]["stream_infos"][0]
             
             if all_tracks is None:
-                # Primera iteración: crear el objeto tracks principal
-                self.license_url = stream_info["license_url"]
-                
+                # Get license URL from android device (CDM accepted), MPD from web device (HD quality)
+                android_stream_info = self.get_avod_device(audio_lang, title, "android")
+                if "data" in android_stream_info:
+                    self.license_url = android_stream_info["data"]["stream_infos"][0]["license_url"]
+                else:
+                    self.license_url = stream_info["license_url"]
                 all_tracks = DASH.from_url(url=stream_info["url"], session=self.session).to_tracks(language=title.language)
                 
                 # Procesar subtítulos (solo una vez)
@@ -336,17 +340,50 @@ class RKTN(Service):
             url=stream_info_url,
         ).json()
 
-    def get_avod(self, audio_language=None, title: Title_T = None):
-        # Si no se especifica idioma, usar el primero disponible
-        if audio_language is None:
-            audio_language = self.audio_languages[0]
-            
+    def get_avod_device(self, audio_language, title, device_key):
+        """Make an AVOD stream request using a specific device key, returns raw response."""
         stream_info_url = self.config["endpoints"]["manifest"].format(
             kind="avod"
         ) + urllib.parse.urlencode(
             {
                 "device_stream_video_quality": self.resolution,
-                "device_identifier": self.config["clients"][self.device][
+                "device_identifier": self.config["clients"][device_key]["device_identifier"],
+                "market_code": self.market_code,
+                "session_uuid": self.session_uuid,
+                "timestamp": f"{int(datetime.datetime.now().timestamp())}122",
+            }
+        )
+        stream_info_url += "&signature=" + self.generate_signature(stream_info_url)
+        return self.session.post(
+            url=stream_info_url,
+            data={
+                "hdr_type": self.hdr_type,
+                "audio_quality": "5.1",
+                "app_version": self.config["clients"][device_key]["app_version"],
+                "content_id": title.id,
+                "video_quality": self.resolution,
+                "audio_language": audio_language,
+                "video_type": "stream",
+                "device_serial": self.config["clients"][device_key]["device_serial"],
+                "content_type": "movies" if self.movie else "episodes",
+                "classification_id": self.classification_id,
+                "subtitle_language": "MIS",
+                "player": self.config["clients"][device_key]["player"],
+            },
+        ).json()
+
+    def get_avod(self, audio_language=None, title: Title_T = None):
+        # Si no se especifica idioma, usar el primero disponible
+        if audio_language is None:
+            audio_language = self.audio_languages[0]
+
+        stream_device = getattr(self, "stream_device", self.device)
+        stream_info_url = self.config["endpoints"]["manifest"].format(
+            kind="avod"
+        ) + urllib.parse.urlencode(
+            {
+                "device_stream_video_quality": self.resolution,
+                "device_identifier": self.config["clients"][stream_device][
                     "device_identifier"
                 ],
                 "market_code": self.market_code,
@@ -360,16 +397,16 @@ class RKTN(Service):
             data={
                 "hdr_type": self.hdr_type,
                 "audio_quality": "5.1",  # Will get better audio in different request to make sure it wont error
-                "app_version": self.config["clients"][self.device]["app_version"],
+                "app_version": self.config["clients"][stream_device]["app_version"],
                 "content_id": title.id,
                 "video_quality": self.resolution,
                 "audio_language": audio_language,  # Usar el idioma especificado
                 "video_type": "stream",
-                "device_serial": self.config["clients"][self.device]["device_serial"],
+                "device_serial": self.config["clients"][stream_device]["device_serial"],
                 "content_type": "movies" if self.movie else "episodes",
                 "classification_id": self.classification_id,
                 "subtitle_language": "MIS",
-                "player": self.config["clients"][self.device]["player"],
+                "player": self.config["clients"][stream_device]["player"],
             },
         ).json()
 
@@ -760,6 +797,8 @@ class RKTN(Service):
         # Obtener view_options desde title o episodes
         view_options = title.get("episodes", [{}])[0].get("view_options") or title.get("view_options")
 
+
+
         # FIJO: Obtener TODOS los idiomas de audio disponibles
         if len(view_options["private"]["offline_streams"]) == 1:
             # Caso 1: Un solo stream con múltiples idiomas
@@ -780,9 +819,11 @@ class RKTN(Service):
         # print(f"\nAvailable audio languages: {', '.join(self.audio_languages)}")
         # selected = input("Type your desired languages, maximum of 3, UPPER CASE (ex: ENG,SPA,FRA): ")
 
+        self.log.info(f"Available audio languages: {self.audio_languages}")
         selected_langs = [lang.strip() for lang in self.desired_audio_language.split(",") if lang.strip() in self.audio_languages]
         if not selected_langs:
-            self.log.error("No selected language. Exiting.")
+            self.log.warning(f"None of the desired languages ({self.desired_audio_language}) matched available ({self.audio_languages}). Using all available.")
+            selected_langs = self.audio_languages
         self.audio_languages = selected_langs
 
         # Log para debug
