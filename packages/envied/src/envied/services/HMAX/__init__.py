@@ -30,7 +30,7 @@ class HMAX(Service):
     ALIASES = ("HMAX", "max", "hbomax")
     #GEOFENCE = ("US",)
 
-    TITLE_RE = r"^(?:https?://(?:www\.|play\.)?hbomax\.com/)?(?P<type>[^/]+)/(?P<id>[^/]+)"
+    TITLE_RE = r"^(?:https?://(?:www\.|play\.)?(?:hbomax|max)\.com/)?(?P<type>[^/]+)/(?P<id>[^/]+)"
 
     VIDEO_CODEC_MAP = {
         "H264": [Video.Codec.AVC],
@@ -230,22 +230,26 @@ class HMAX(Service):
 
         if content_type in ["show", "mini-series", "topical"]:
             episodes = []
-            if content_type == "mini-series":
-                alias = "generic-miniseries-page-rail-episodes"
-            elif content_type == "topical":
+            if content_type == "topical":
                 alias = "generic-topical-show-page-rail-episodes"
+                collection_slug = "generic-topical-show-page-rail-episodes"
             else:
-                alias = "-%s-page-rail-episodes-tabbed-content" % (content_type)
+                # both "show" and "mini-series" use the same show-page rail structure
+                alias = "-show-page-rail-episodes-tabbed-content"
+                collection_slug = "generic-show-page-rail-episodes-tabbed-content"
 
             included_dt = response.json()["included"]
-            
-            season_data = [data for included in included_dt for key, data in included.items()
-                           if key == "attributes" for k, d in data.items() if alias in str(d).lower()][0]
 
+            season_data_list = [data for included in included_dt for key, data in included.items()
+                           if key == "attributes" for k, d in data.items() if alias in str(d).lower()]
+            if not season_data_list:
+                raise ValueError(f"Could not find season rail for content type '{content_type}' (alias: {alias!r})")
+
+            season_data = season_data_list[0]
             season_data = season_data["component"]["filters"][0]
-            
+
             seasons = [int(season["value"]) for season in season_data["options"]]
-            
+
             season_parameters = [(int(season["value"]), season["parameter"]) for season in season_data["options"]
                 for season_number in seasons if int(season["value"]) == int(season_number)]
 
@@ -255,7 +259,7 @@ class HMAX(Service):
             image_map = {}  # accumulate images across all seasons
             for (value, parameter) in season_parameters:
                 data = self.session.get(
-                    url=self.config['endpoints']['showPages'] % (external_id, parameter)
+                    url=self.config['endpoints']['episodePages'] % (collection_slug, external_id, parameter)
                 ).json()
                 
                 try:
@@ -417,6 +421,14 @@ class HMAX(Service):
                                     'xhe',
                                 ],
                             },
+                            {
+                                'codec': 'ac3',
+                                'profiles': ['main'],
+                            },
+                            {
+                                'codec': 'ec3',
+                                'profiles': ['main', 'atmos'],
+                            },
                         ],
                     },
                 },
@@ -435,8 +447,8 @@ class HMAX(Service):
                     },
                     'videoSink': {
                         'lastKnownStatus': {
-                            'width': 1290,
-                            'height': 2796,
+                            'width': 1920,
+                            'height': 1080,
                         },
                         'capabilities': {
                             'colorGamuts': [
@@ -448,6 +460,23 @@ class HMAX(Service):
                                 'hdr10plus',
                                 'hdr10',
                                 'hlg',
+                            ],
+                        },
+                    },
+                    'audioSink': {
+                        'lastKnownStatus': {
+                            'channels': 6,
+                        },
+                        'capabilities': {
+                            'decoders': [
+                                {
+                                    'codec': 'ac3',
+                                    'profiles': ['main'],
+                                },
+                                {
+                                    'codec': 'ec3',
+                                    'profiles': ['main', 'atmos'],
+                                },
                             ],
                         },
                     },
