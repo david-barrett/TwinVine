@@ -1,6 +1,10 @@
+client_id: 'b6e8772f-e2bf-4f67-9787-d4dc5f9b0bec'
+
 endpoints:
+  login: 'https://default.any-any.prd.api.hbomax.com/login'
+  token: 'https://default.any-any.prd.api.hbomax.com/token'
+  bootstrap: 'https://default.any-any.prd.api.hbomax.com/session-context/headwaiter/v1/bootstrap'
   contentRoutes: 'https://default.prd.api.hbomax.com/cms/routes/%s/%s?include=default'
   moviePages: 'https://default.prd.api.hbomax.com/content/videos/%s/activeVideoForShow?&include=edit'
   playbackInfo: 'https://default.prd.api.hbomax.com/any/playback/v1/playbackInfo'
   showPages: 'https://default.prd.api.hbomax.com/cms/collections/generic-show-page-rail-episodes-tabbed-content?include=default&pf[show.id]=%s&%s'
-  bootstrap: 'https://default.prd.api.hbomax.com/session-context/headwaiter/v1/bootstrap'

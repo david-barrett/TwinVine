@@ -86,11 +86,10 @@ class MAX(Service):
         
         # Extract authentication tokens from cookies
         try:
-            token = next(cookie.value for cookie in cookies if cookie.name == "st")
             session_data = next(cookie.value for cookie in cookies if cookie.name == "session")
             device_id = json.loads(session_data)
         except (StopIteration, json.JSONDecodeError):
-            raise EnvironmentError("Required authentication cookies not found.")
+            raise EnvironmentError("Required authentication cookies not found. Need 'session' cookie from hbomax.com.")
         
         # Configure headers based on device type
         self.session.headers.update({

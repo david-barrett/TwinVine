@@ -67,33 +67,71 @@ class HMAX(Service):
 
     def authenticate(self, cookies: Optional[CookieJar] = None, credential: Optional[Credential] = None) -> None:
         super().authenticate(cookies, credential)
-        if not cookies:
-            raise EnvironmentError("Service requires Cookies for Authentication.")
-        
-        try:
-            token = next(cookie.value for cookie in cookies if cookie.name == "st")
-            session_data = next(cookie.value for cookie in cookies if cookie.name == "session")
-            device_id = json.loads(session_data)
-        except (StopIteration, json.JSONDecodeError):
-            raise EnvironmentError("Required authentication cookies not found.")
-        
+
         self.session.headers.update({
-                'User-Agent': 'BEAM-Android/1.0.0.104 (SONY/XR-75X95EL)',
-                'Accept': 'application/json, text/plain, */*',
-                'Content-Type': 'application/json',
-                'x-disco-client': 'SAMSUNGTV:124.0.0.0:beam:4.0.0.118',
-                'x-disco-params': 'realm=bolt,bid=beam,features=ar',
-                'x-device-info': 'beam/4.0.0.118 (Samsung/Samsung-Unknown; Tizen/124.0.0.0; f198a6c1-c582-4725-9935-64eb6b17c3cd/87a996fa-4917-41ae-9b6d-c7f521f0cb78)',
-                'traceparent': '00-315ac07a3de9ad1493956cf1dd5d1313-988e057938681391-01',
-                'tracestate': f'wbd=session:{device_id}',
-                'Origin': 'https://play.hbomax.com',
-                'Referer': 'https://play.hbomax.com/',
-            })
-        
-        auth_token = self._get_device_token()
-        self.session.headers.update({
-            "x-wbd-session-state": auth_token
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Content-Type': 'application/json',
+            'x-disco-client': 'WEB:UNKNOWN:beam:2.58.0',
+            'x-disco-params': 'realm=bolt,bid=beam,features=ar',
+            'Origin': 'https://play.hbomax.com',
+            'Referer': 'https://play.hbomax.com/',
         })
+
+        # Try to get st token: first from cookies, then via credential login
+        st_token = None
+        if cookies:
+            st_token = next((c.value for c in cookies if c.name == "st"), None)
+
+        if not st_token and credential:
+            self.log.info("No st cookie found — logging in with credentials...")
+            st_token = self._login(credential.username, credential.password)
+
+        if not st_token:
+            raise EnvironmentError(
+                "Authentication failed: no 'st' cookie and no credentials provided. "
+                "Add credentials to your vault for HMAX."
+            )
+
+        # Exchange st token for an anonymous device token, then bootstrap
+        device_id = str(uuid.uuid4())
+        client_id = self.config.get("client_id", "b6e8772f-e2bf-4f67-9787-d4dc5f9b0bec")
+        self.session.headers.update({
+            "x-device-info": f"beam/2.58.0 (Unknown/Unknown; Unknown/Unknown; {device_id}/{client_id})",
+            "Authorization": f"Bearer {st_token}",
+        })
+        token_resp = self.session.get(
+            self.config['endpoints']['token'],
+            params={"realm": "bolt", "deviceId": device_id},
+        )
+        if not token_resp.ok:
+            self.log.error(f"Token exchange failed {token_resp.status_code}: {token_resp.text[:300]}")
+            token_resp.raise_for_status()
+        access_token = token_resp.json()["data"]["attributes"]["token"]
+
+        self.session.headers.update({"Authorization": f"Bearer {access_token}"})
+
+        auth_token = self._get_device_token()
+        if auth_token:
+            self.session.headers.update({"x-wbd-session-state": auth_token})
+
+    def _login(self, email: str, password: str) -> str:
+        """Login with email/password and return the st token."""
+        r = self.session.post(
+            self.config['endpoints']['login'],
+            json={"credentials": {"username": email, "password": password}},
+        )
+        if not r.ok:
+            self.log.error(f"Login failed {r.status_code}: {r.text[:300]}")
+            raise EnvironmentError(f"Login failed ({r.status_code}). Check your HMAX credentials.")
+        data = r.json()
+        token = (
+            data.get("data", {}).get("attributes", {}).get("token")
+            or data.get("token")
+        )
+        if not token:
+            raise EnvironmentError(f"Login succeeded but no token in response: {data}")
+        return token
 
     def search(self) -> Generator[SearchResult, None, None]:
         search_url = "https://default.prd.api.hbomax.com/search"
@@ -567,6 +605,8 @@ class HMAX(Service):
 
     def _get_device_token(self):
         response = self.session.post(self.config['endpoints']['bootstrap'])
+        if not response.ok:
+            self.log.error(f"Bootstrap failed {response.status_code}: {response.text[:500]}")
         response.raise_for_status()
         return response.headers.get('x-wbd-session-state')
 
