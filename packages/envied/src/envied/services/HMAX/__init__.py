@@ -499,8 +499,6 @@ class HMAX(Service):
         video_info = next(x for x in playback_data['videos'] if x['type'] == 'main')
         title.language = Language.get(video_info['defaultAudioSelection']['language'])
 
-        self.log.debug(f" + Playback data keys: {list(playback_data.keys())}")
-
         fallback_url = playback_data["fallback"]["manifest"]["url"]
         fallback_url = fallback_url.replace('fly', 'akm').replace('gcp', 'akm')
 
@@ -520,8 +518,6 @@ class HMAX(Service):
         dash_manifest = DASH.from_url(url=manifest_url, session=self.session)
 
         tracks = dash_manifest.to_tracks(language=title.language)
-
-        self.log.debug(tracks)
 
         tracks.videos = self._dedupe(tracks.videos)
         tracks.audio = self._dedupe(tracks.audio)
