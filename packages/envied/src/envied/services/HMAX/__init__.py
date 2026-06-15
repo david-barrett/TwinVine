@@ -233,8 +233,10 @@ class HMAX(Service):
             if content_type == "topical":
                 alias = "generic-topical-show-page-rail-episodes"
                 collection_slug = "generic-topical-show-page-rail-episodes"
+            elif content_type == "mini-series":
+                alias = "generic-miniseries-page-rail-episodes"
+                collection_slug = "generic-miniseries-page-rail-episodes"
             else:
-                # both "show" and "mini-series" use the same show-page rail structure
                 alias = "-show-page-rail-episodes-tabbed-content"
                 collection_slug = "generic-show-page-rail-episodes-tabbed-content"
 
@@ -517,40 +519,6 @@ class HMAX(Service):
 
         dash_manifest = DASH.from_url(url=manifest_url, session=self.session)
 
-        # Max's SSAI manifests combine all period KIDs into one PSSH, but the
-        # license server hard-caps responses at 3 keys. Rewrite each AdaptationSet's
-        # Widevine <pssh> in the manifest XML to a single-KID PSSH before to_tracks()
-        # so every downstream DRM object (including the re-read during download) sees
-        # only the one KID that belongs to that track.
-        from pywidevine.pssh import PSSH as WvPSSH
-        WV_SYSTEM_ID = uuid.UUID("edef8ba9-79d6-4ace-a3c8-27dcd51d21ed")
-        WV_SCHEME = "urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
-        CENC_SCHEME = "urn:mpeg:cenc:2013"
-        rewrites = 0
-        for period in dash_manifest.manifest.findall("Period"):
-            for adapt in period.findall("AdaptationSet"):
-                # Find the KID for this AdaptationSet from the CENC element
-                kid_str = None
-                for cp in adapt.findall("ContentProtection"):
-                    raw_kid = cp.get("default_KID") or cp.get(f"{{{CENC_SCHEME}}}default_KID")
-                    if raw_kid:
-                        kid_str = raw_kid.replace("-", "").lower()
-                        break
-                if not kid_str:
-                    continue
-                track_kid = uuid.UUID(kid_str)
-                # Replace the <pssh> text in the Widevine ContentProtection element
-                for cp in adapt.findall("ContentProtection"):
-                    if cp.get("schemeIdUri", "").lower() != WV_SCHEME:
-                        continue
-                    pssh_elem = cp.find("pssh") or cp.find(f"{{{CENC_SCHEME}}}pssh")
-                    if pssh_elem is None:
-                        continue
-                    new_pssh = WvPSSH.new(system_id=WV_SYSTEM_ID, key_ids=[track_kid])
-                    pssh_elem.text = new_pssh.dumps()
-                    rewrites += 1
-        self.log.debug(f" + Rewrote {rewrites} PSSH elements to single-KID")
-
         tracks = dash_manifest.to_tracks(language=title.language)
 
         self.log.debug(tracks)
@@ -654,18 +622,12 @@ class HMAX(Service):
 
         license_url = self.wv_license_url
 
-        self.log.debug(f" + WV license URL: {license_url}")
-        self.log.debug(f" + Challenge size: {len(challenge)} bytes")
-        self.log.debug(f" + Track type: {type(track).__name__}")
-        self.log.debug(f" + Track attrs with pssh/kid/key: {[a for a in dir(track) if any(x in a.lower() for x in ('pssh','kid','key','drm','crypt'))]}")
-
         response = self.session.post(
             url=license_url,
             data=challenge,
             headers={"Content-Type": "application/octet-stream"},
         )
 
-        self.log.debug(f" + License response: HTTP {response.status_code}, {len(response.content)} bytes")
         if not response.ok:
             self.log.error(f" - License error body: {response.text[:500]}")
         response.raise_for_status()
