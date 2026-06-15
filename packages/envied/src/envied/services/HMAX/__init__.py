@@ -54,16 +54,19 @@ class HMAX(Service):
 
     def __init__(self, ctx, title, video_codec, audio_codec):
         super().__init__(ctx)
-        
+
         self.title = title
         self.vcodec = video_codec
         self.acodec = audio_codec
-        
+
         range_param = ctx.parent.params.get("range_")
         self.range = range_param[0].name if range_param else "SDR"
-        
+
         if self.range == 'HDR10':
             self.vcodec = "H265"
+
+        if not ctx.parent.params.get("quality"):
+            ctx.parent.params["quality"] = [720]
 
     def authenticate(self, cookies: Optional[CookieJar] = None, credential: Optional[Credential] = None) -> None:
         super().authenticate(cookies, credential)
@@ -291,8 +294,8 @@ class HMAX(Service):
                         id_=episode['id'],
                         service=self.__class__,
                         title=content_title,
-                        season=season_map.get(episode['attributes'].get('seasonNumber')),
-                        number=episode['attributes']['episodeNumber'],
+                        season=season_map.get(int(episode['attributes'].get('seasonNumber', 0))),
+                        number=int(episode['attributes']['episodeNumber']),
                         name=episode['attributes']['name'],
                         year=year,
                         data=ep_data
@@ -313,20 +316,20 @@ class HMAX(Service):
                     'deviceId': '2dec6cb0-eb34-45f9-bbc9-a0533597303c',
                     'browser': {
                         'name': 'chrome',
-                        'version': '113.0.0.0',
+                        'version': '131.0.0.0',
                     },
-                    'make': 'Microsoft',
-                    'model': 'XBOX-Unknown',
+                    'make': 'Unknown',
+                    'model': 'Unknown',
                     'os': {
-                        'name': 'Windows',
-                        'version': '113.0.0.0',
+                        'name': 'macOS',
+                        'version': '10.15.7',
                     },
-                    'platform': 'XBOX',
-                    'deviceType': 'xbox',
+                    'platform': 'browser',
+                    'deviceType': 'desktop',
                     'player': {
                         'sdk': {
-                            'name': 'Beam Player Console',
-                            'version': '1.0.2.4',
+                            'name': 'Beam Player Web',
+                            'version': '2.58.0',
                         },
                         'mediaEngine': {
                             'name': 'GLUON_BROWSER',
@@ -342,7 +345,9 @@ class HMAX(Service):
                 'capabilities': {
                     'manifests': {
                         'formats': {
-                            'dash': {},
+                            'dash': {
+                                'ssai': False,
+                            },
                         },
                     },
                 'codecs': {
@@ -463,6 +468,8 @@ class HMAX(Service):
         video_info = next(x for x in playback_data['videos'] if x['type'] == 'main')
         title.language = Language.get(video_info['defaultAudioSelection']['language'])
 
+        self.log.debug(f" + Playback data keys: {list(playback_data.keys())}")
+
         fallback_url = playback_data["fallback"]["manifest"]["url"]
         fallback_url = fallback_url.replace('fly', 'akm').replace('gcp', 'akm')
 
@@ -470,7 +477,7 @@ class HMAX(Service):
             self.wv_license_url = playback_data["drm"]["schemes"]["widevine"]["licenseUrl"]
         except (KeyError, IndexError):
             self.wv_license_url = None
-            
+
         try:
             self.pr_license_url = playback_data["drm"]["schemes"]["playready"]["licenseUrl"]
         except (KeyError, IndexError):
@@ -480,20 +487,61 @@ class HMAX(Service):
         self.log.info(f" + Manifest: {manifest_url}")
 
         dash_manifest = DASH.from_url(url=manifest_url, session=self.session)
+
+        # Max's SSAI manifests combine all period KIDs into one PSSH, but the
+        # license server hard-caps responses at 3 keys. Rewrite each AdaptationSet's
+        # Widevine <pssh> in the manifest XML to a single-KID PSSH before to_tracks()
+        # so every downstream DRM object (including the re-read during download) sees
+        # only the one KID that belongs to that track.
+        from pywidevine.pssh import PSSH as WvPSSH
+        WV_SYSTEM_ID = uuid.UUID("edef8ba9-79d6-4ace-a3c8-27dcd51d21ed")
+        WV_SCHEME = "urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+        CENC_SCHEME = "urn:mpeg:cenc:2013"
+        rewrites = 0
+        for period in dash_manifest.manifest.findall("Period"):
+            for adapt in period.findall("AdaptationSet"):
+                # Find the KID for this AdaptationSet from the CENC element
+                kid_str = None
+                for cp in adapt.findall("ContentProtection"):
+                    raw_kid = cp.get("default_KID") or cp.get(f"{{{CENC_SCHEME}}}default_KID")
+                    if raw_kid:
+                        kid_str = raw_kid.replace("-", "").lower()
+                        break
+                if not kid_str:
+                    continue
+                track_kid = uuid.UUID(kid_str)
+                # Replace the <pssh> text in the Widevine ContentProtection element
+                for cp in adapt.findall("ContentProtection"):
+                    if cp.get("schemeIdUri", "").lower() != WV_SCHEME:
+                        continue
+                    pssh_elem = cp.find("pssh") or cp.find(f"{{{CENC_SCHEME}}}pssh")
+                    if pssh_elem is None:
+                        continue
+                    new_pssh = WvPSSH.new(system_id=WV_SYSTEM_ID, key_ids=[track_kid])
+                    pssh_elem.text = new_pssh.dumps()
+                    rewrites += 1
+        self.log.debug(f" + Rewrote {rewrites} PSSH elements to single-KID")
+
         tracks = dash_manifest.to_tracks(language=title.language)
 
-        
         self.log.debug(tracks)
 
         tracks.videos = self._dedupe(tracks.videos)
         tracks.audio = self._dedupe(tracks.audio)
-        
-        tracks.subtitles.clear()
 
-        new_subtitles = self._process_max_subtitles(dash_manifest, title.language)
-        
-        for subtitle in new_subtitles:
-            tracks.add(subtitle)
+        # Deduplicate subtitle tracks — SSAI multi-period manifests repeat the same
+        # language track in each period. The DASH downloader already collects segments
+        # across all matching periods, so we just need one track per language/role combo.
+        seen_subs: set[tuple] = set()
+        deduped_subs = []
+        for sub in tracks.subtitles:
+            key = (str(sub.language), getattr(sub, 'sdh', False), getattr(sub, 'forced', False), getattr(sub, 'name', ''))
+            if key not in seen_subs:
+                seen_subs.add(key)
+                deduped_subs.append(sub)
+        tracks.subtitles.clear()
+        for sub in deduped_subs:
+            tracks.add(sub)
 
         if self.vcodec:
             tracks.videos = [x for x in tracks.videos if x.codec in self.VIDEO_CODEC_MAP[self.vcodec]]
@@ -574,12 +622,28 @@ class HMAX(Service):
     def get_widevine_license(self, *, challenge: bytes, title: Title_T, track: AnyTrack) -> Optional[Union[bytes, str]]:
         if not self.wv_license_url:
             return None
-            
+
+        license_url = self.wv_license_url
+
+        self.log.debug(f" + WV license URL: {license_url}")
+        self.log.debug(f" + Challenge size: {len(challenge)} bytes")
+        self.log.debug(f" + Track type: {type(track).__name__}")
+        self.log.debug(f" + Track attrs with pssh/kid/key: {[a for a in dir(track) if any(x in a.lower() for x in ('pssh','kid','key','drm','crypt'))]}")
+
         response = self.session.post(
-            url=self.wv_license_url,
-            data=challenge
+            url=license_url,
+            data=challenge,
+            headers={"Content-Type": "application/octet-stream"},
         )
+
+        self.log.debug(f" + License response: HTTP {response.status_code}, {len(response.content)} bytes")
+        if not response.ok:
+            self.log.error(f" - License error body: {response.text[:500]}")
         response.raise_for_status()
+
+        if len(response.content) < 50:
+            self.log.warning(f" - Suspiciously small license response ({len(response.content)} bytes): {response.content!r}")
+
         return response.content
 
     def get_playready_license(self, *, challenge: bytes, title: Title_T, track: AnyTrack) -> Optional[bytes]:
