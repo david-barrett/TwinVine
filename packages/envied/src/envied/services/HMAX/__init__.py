@@ -1,6 +1,7 @@
 import hashlib
 import json
 import re
+import sys
 import uuid
 from datetime import datetime
 from hashlib import md5
@@ -71,8 +72,15 @@ class HMAX(Service):
     def authenticate(self, cookies: Optional[CookieJar] = None, credential: Optional[Credential] = None) -> None:
         super().authenticate(cookies, credential)
 
+        if sys.platform == "darwin":
+            ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        elif sys.platform == "win32":
+            ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        else:
+            ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            'User-Agent': ua,
             'Accept': 'application/json, text/plain, */*',
             'Content-Type': 'application/json',
             'x-disco-client': 'WEB:UNKNOWN:beam:2.58.0',
